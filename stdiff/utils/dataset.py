@@ -45,6 +45,22 @@ class LitDataModule(pl.LightningDataModule):
             self.train_transform = transforms.Compose([VidResize((self.img_size, self.img_size)), VidRandomHorizontalFlip(0.5), VidRandomVerticalFlip(0.5), VidToTensor(), self.norm_transform])
             self.test_transform = transforms.Compose([VidResize((self.img_size, self.img_size)), VidToTensor(), self.norm_transform])
 
+        if cfg.Dataset.name == 'KITTI_RANGE':
+            # Range images are already 64x2048, resize to model input size if needed
+            # Handle ListConfig from omegaconf
+            if hasattr(self.img_size, '__getitem__') and hasattr(self.img_size, '__len__') and len(self.img_size) == 2:
+                # Non-square image size: [height, width] (handles list, tuple, ListConfig)
+                resize_size = (int(self.img_size[0]), int(self.img_size[1]))
+            else:
+                # Square image size (backward compatibility)
+                resize_size = (int(self.img_size), int(self.img_size))
+            # Initialize global min/max as None, will be computed in setup()
+            self.range_image_global_min = None
+            self.range_image_global_max = None
+            # Transforms will be set up in setup() after global min/max is computed
+            # For now, just store resize_size
+            self.kitti_range_resize_size = resize_size
+
         if cfg.Dataset.name == 'MNIST':
             self.train_transform = transforms.Compose([VidResize((self.img_size, self.img_size)), VidRandomHorizontalFlip(0.5), VidRandomVerticalFlip(0.5), VidToTensor(), self.norm_transform])
             self.test_transform = transforms.Compose([VidResize((self.img_size, self.img_size)), VidToTensor(), self.norm_transform])
@@ -69,10 +85,23 @@ class LitDataModule(pl.LightningDataModule):
         p_resize = None
         vp_size = cfg.STDiff.Diffusion.unet_config.sample_size
         vo_size = cfg.STDiff.DiffNet.MotionEncoder.image_size
-        if vp_size != self.img_size:
-            p_resize = transforms.Resize(vp_size, interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
-        if vo_size != self.img_size:
-            o_resize = transforms.Resize(vo_size, interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+        # Handle non-square sizes: convert to tuple for comparison (handles list, tuple, ListConfig)
+        if hasattr(vp_size, '__getitem__') and hasattr(vp_size, '__len__') and len(vp_size) == 2:
+            vp_size_tuple = (int(vp_size[0]), int(vp_size[1]))
+        else:
+            vp_size_tuple = (int(vp_size), int(vp_size))
+        if hasattr(vo_size, '__getitem__') and hasattr(vo_size, '__len__') and len(vo_size) == 2:
+            vo_size_tuple = (int(vo_size[0]), int(vo_size[1]))
+        else:
+            vo_size_tuple = (int(vo_size), int(vo_size))
+        if hasattr(self.img_size, '__getitem__') and hasattr(self.img_size, '__len__') and len(self.img_size) == 2:
+            img_size_tuple = (int(self.img_size[0]), int(self.img_size[1]))
+        else:
+            img_size_tuple = (int(self.img_size), int(self.img_size))
+        if vp_size_tuple != img_size_tuple:
+            p_resize = transforms.Resize(vp_size_tuple, interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
+        if vo_size_tuple != img_size_tuple:
+            o_resize = transforms.Resize(vo_size_tuple, interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
         self.collate_fn = partial(svrfcn, rand_Tp=cfg.Dataset.rand_Tp, rand_predict=cfg.Dataset.rand_predict, o_resize=o_resize, p_resize=p_resize, half_fps=cfg.Dataset.half_fps)
 
     def setup(self, stage: Optional[str] = None):
@@ -89,6 +118,79 @@ class LitDataModule(pl.LightningDataModule):
                                                 num_observed_frames= self.cfg.Dataset.num_observed_frames, num_predict_frames= self.cfg.Dataset.num_predict_frames
                                                 )
                 self.train_set, self.val_set = KITTITrainData()
+
+            if self.cfg.Dataset.name == 'KITTI_RANGE':
+                # Get test folder IDs from config or use default
+                test_folder_ids = self.cfg.Dataset.get("test_folder_ids", [8, 9, 10])
+                # In deploy mode, use all sequences for training (no validation split)
+                # Otherwise, split for validation
+                use_val = self.cfg.Dataset.phase != 'deploy'
+                
+                # First, create dataset without transform to compute global min/max
+                # We'll use a dummy transform for now
+                # Note: Don't pass global_min/global_max here since we're computing them
+                dummy_transform = transforms.Compose([VidToTensor()])
+                KITTIRangeTrainData_temp = KITTIRangeImageDataset(self.cfg.Dataset.dir, test_folder_ids, 
+                                                                   transform = dummy_transform, train = True, val = use_val,
+                                                                   num_observed_frames= self.cfg.Dataset.num_observed_frames, 
+                                                                   num_predict_frames= self.cfg.Dataset.num_predict_frames)
+                if use_val:
+                    train_set_temp, _ = KITTIRangeTrainData_temp()
+                else:
+                    train_set_temp = KITTIRangeTrainData_temp()
+                
+                # Compute global min/max from training set (only valid pixels)
+                # Use a sample-based approach for efficiency (sample up to 1000 clips)
+                print("Computing global min/max from training set...")
+                all_valid_pixels = []
+                num_clips_to_sample = min(1000, len(train_set_temp))  # Sample up to 1000 clips
+                sample_indices = random.sample(range(len(train_set_temp)), num_clips_to_sample) if len(train_set_temp) > 1000 else range(len(train_set_temp))
+                
+                for idx in tqdm(sample_indices, desc="Computing global min/max", disable=False):
+                    clip_files = train_set_temp.clips[idx]
+                    for npy_path in clip_files:
+                        range_img = np.load(npy_path.absolute().as_posix())
+                        if len(range_img.shape) > 2:
+                            range_img = range_img.squeeze()
+                        valid_mask = range_img > 0
+                        if valid_mask.any():
+                            all_valid_pixels.extend(range_img[valid_mask].astype(np.float32).tolist())
+                
+                if len(all_valid_pixels) > 0:
+                    all_valid_pixels_array = np.array(all_valid_pixels, dtype=np.float32)
+                    self.range_image_global_min = float(np.min(all_valid_pixels_array))
+                    self.range_image_global_max = float(np.max(all_valid_pixels_array))
+                    print(f"Computed global min from {len(all_valid_pixels)} valid pixels: {self.range_image_global_min:.6f}")
+                    print(f"Computed global max from {len(all_valid_pixels)} valid pixels: {self.range_image_global_max:.6f}")
+                else:
+                    self.range_image_global_min = 0.0
+                    self.range_image_global_max = 85.0
+                    print("Warning: No valid pixels found, using min=0.0, max=85.0")
+                
+                # Now create transforms with global min-max normalization
+                self.train_transform = transforms.Compose([
+                    VidResize((self.kitti_range_resize_size[0], self.kitti_range_resize_size[1])),
+                    VidToTensor(),
+                    self.norm_transform
+                ])
+                self.test_transform = transforms.Compose([
+                    VidResize((self.kitti_range_resize_size[0], self.kitti_range_resize_size[1])),
+                    VidToTensor(),
+                    self.norm_transform
+                ])
+                
+                # Create actual datasets with proper transforms and global min/max
+                KITTIRangeTrainData = KITTIRangeImageDataset(self.cfg.Dataset.dir, test_folder_ids, 
+                                                             transform = self.train_transform, train = True, val = use_val,
+                                                             num_observed_frames= self.cfg.Dataset.num_observed_frames, 
+                                                             num_predict_frames= self.cfg.Dataset.num_predict_frames,
+                                                             global_min=self.range_image_global_min, 
+                                                             global_max=self.range_image_global_max)
+                if use_val:
+                    self.train_set, self.val_set = KITTIRangeTrainData()
+                else:
+                    self.train_set = KITTIRangeTrainData()
+                    self.val_set = None
 
             if self.cfg.Dataset.name == 'BAIR':
                 BAIR_train_whole_set = BAIRDataset(Path(self.cfg.Dataset.dir).joinpath('train'), self.train_transform, color_mode = 'RGB', 
@@ -125,15 +227,21 @@ class LitDataModule(pl.LightningDataModule):
 
             #Use all training dataset for the final training
             if self.cfg.Dataset.phase == 'deploy':
-                self.train_set = ConcatDataset([self.train_set, self.val_set])
+                if self.val_set is not None:
+                    self.train_set = ConcatDataset([self.train_set, self.val_set])
+                # If val_set is None, train_set already contains all data
 
             dev_set_size = self.cfg.Dataset.dev_set_size
             if dev_set_size is not None:
                 self.train_set, _ = random_split(self.train_set, [dev_set_size, len(self.train_set) - dev_set_size], generator=torch.Generator().manual_seed(2021))
-                self.val_set, _ = random_split(self.val_set, [dev_set_size, len(self.val_set) - dev_set_size], generator=torch.Generator().manual_seed(2021))
+                if self.val_set is not None:
+                    self.val_set, _ = random_split(self.val_set, [dev_set_size, len(self.val_set) - dev_set_size], generator=torch.Generator().manual_seed(2021))
             
             self.len_train_loader = len(self.train_dataloader())
-            self.len_val_loader = len(self.val_dataloader())
+            if self.val_set is not None:
+                self.len_val_loader = len(self.val_dataloader())
+            else:
+                self.len_val_loader = 0
 
         # Assign Test split(s) for use in Dataloaders
         if stage in (None, "test"):
@@ -147,6 +255,65 @@ class LitDataModule(pl.LightningDataModule):
                                                 num_observed_frames= self.cfg.Dataset.test_num_observed_frames, num_predict_frames= self.cfg.Dataset.test_num_predict_frames,
                                                 )
                 self.test_set = KITTITrainData()
+
+            if self.cfg.Dataset.name == 'KITTI_RANGE':
+                test_folder_ids = self.cfg.Dataset.get("test_folder_ids", [8, 9, 10])
+                # Use global min/max computed during setup (if available)
+                # If not available (e.g., when setup is called with stage="test" only), compute them
+                global_min = getattr(self, 'range_image_global_min', None)
+                global_max = getattr(self, 'range_image_global_max', None)
+                
+                if global_min is None or global_max is None:
+                    # Compute global min/max from training set if not already computed
+                    print("Computing global min/max for test dataset...")
+                    dummy_transform = transforms.Compose([VidToTensor()])
+                    use_val = self.cfg.Dataset.phase != 'deploy'
+                    KITTIRangeTrainData_temp = KITTIRangeImageDataset(self.cfg.Dataset.dir, test_folder_ids, 
+                                                                       transform = dummy_transform, train = True, val = use_val,
+                                                                       num_observed_frames= self.cfg.Dataset.num_observed_frames, 
+                                                                       num_predict_frames= self.cfg.Dataset.num_predict_frames)
+                    if use_val:
+                        train_set_temp, _ = KITTIRangeTrainData_temp()
+                    else:
+                        train_set_temp = KITTIRangeTrainData_temp()
+                    
+                    # Compute global min/max from training set (only valid pixels)
+                    all_valid_pixels = []
+                    num_clips_to_sample = min(1000, len(train_set_temp))
+                    sample_indices = random.sample(range(len(train_set_temp)), num_clips_to_sample) if len(train_set_temp) > 1000 else range(len(train_set_temp))
+                    
+                    for idx in tqdm(sample_indices, desc="Computing global min/max", disable=False):
+                        clip_files = train_set_temp.clips[idx]
+                        for npy_path in clip_files:
+                            range_img = np.load(npy_path.absolute().as_posix())
+                            if len(range_img.shape) > 2:
+                                range_img = range_img.squeeze()
+                            valid_mask = range_img > 0
+                            if valid_mask.any():
+                                all_valid_pixels.extend(range_img[valid_mask].astype(np.float32).tolist())
+                    
+                    if len(all_valid_pixels) > 0:
+                        all_valid_pixels_array = np.array(all_valid_pixels, dtype=np.float32)
+                        global_min = float(np.min(all_valid_pixels_array))
+                        global_max = float(np.max(all_valid_pixels_array))
+                        self.range_image_global_min = global_min
+                        self.range_image_global_max = global_max
+                        print(f"Computed global min from {len(all_valid_pixels)} valid pixels: {global_min:.6f}")
+                        print(f"Computed global max from {len(all_valid_pixels)} valid pixels: {global_max:.6f}")
+                    else:
+                        global_min = 0.0
+                        global_max = 85.0
+                        self.range_image_global_min = global_min
+                        self.range_image_global_max = global_max
+                        print("Warning: No valid pixels found, using min=0.0, max=85.0")
+                
+                KITTIRangeTestData = KITTIRangeImageDataset(self.cfg.Dataset.dir, test_folder_ids,
+                                                            transform = self.test_transform, train = False, val = False,
+                                                            num_observed_frames= self.cfg.Dataset.test_num_observed_frames, 
+                                                            num_predict_frames= self.cfg.Dataset.test_num_predict_frames,
+                                                            global_min=global_min, 
+                                                            global_max=global_max)
+                self.test_set = KITTIRangeTestData()
 
             if self.cfg.Dataset.name == 'BAIR':
                 self.test_set = BAIRDataset(Path(self.cfg.Dataset.dir).joinpath('test'), self.test_transform, color_mode = 'RGB', 
@@ -173,7 +340,10 @@ class LitDataModule(pl.LightningDataModule):
         return DataLoader(self.train_set, shuffle = True, batch_size=self.cfg.Dataset.batch_size, num_workers=self.cfg.Dataset.num_workers, drop_last = True, collate_fn = self.collate_fn)
 
     def val_dataloader(self):
-        return DataLoader(self.val_set, shuffle = False, batch_size=self.cfg.Dataset.batch_size, num_workers=self.cfg.Dataset.num_workers, drop_last = True, collate_fn = self.collate_fn)
+        if self.val_set is not None:
+            return DataLoader(self.val_set, shuffle = False, batch_size=self.cfg.Dataset.batch_size, num_workers=self.cfg.Dataset.num_workers, drop_last = True, collate_fn = self.collate_fn)
+        else:
+            return None
 
     def test_dataloader(self):
         return DataLoader(self.test_set, shuffle = False, batch_size=self.cfg.Dataset.batch_size, num_workers=self.cfg.Dataset.num_workers, drop_last = False, collate_fn = self.collate_fn)
@@ -182,7 +352,11 @@ class LitDataModule(pl.LightningDataModule):
 def get_lightning_module_dataloader(cfg):
     pl_datamodule = LitDataModule(cfg)
     pl_datamodule.setup()
-    return pl_datamodule.train_dataloader(), pl_datamodule.val_dataloader(), pl_datamodule.test_dataloader()
+    train_loader = pl_datamodule.train_dataloader()
+    val_loader = pl_datamodule.val_dataloader()
+    test_loader = pl_datamodule.test_dataloader()
+    # Return datamodule as well so we can access global min/max for KITTI_RANGE
+    return train_loader, val_loader, test_loader, pl_datamodule
 
 class KTHDataset(object):
     """
@@ -600,12 +774,25 @@ class StochasticMovingMNIST(Dataset):
 def svrfcn(batch_data, rand_Tp = 3, rand_predict = True, o_resize = None, p_resize = None, half_fps = False):
     """
     Single video dataset random future frames collate function
-    batch_data: list of tuples, each tuple is (observe_clip, predict_clip)
+    batch_data: list of tuples, each tuple is (observe_clip, predict_clip) or 
+                (observe_clip, predict_clip, observe_mask, predict_mask) for range images
     """
     
-    observe_clips, predict_clips = zip(*batch_data)
-    observe_batch = torch.stack(observe_clips, dim=0)
-    predict_batch = torch.stack(predict_clips, dim=0)
+    # Check if masks are provided (for range images)
+    has_masks = len(batch_data[0]) == 4
+    
+    if has_masks:
+        observe_clips, predict_clips, observe_masks, predict_masks = zip(*batch_data)
+        observe_batch = torch.stack(observe_clips, dim=0)
+        predict_batch = torch.stack(predict_clips, dim=0)
+        observe_mask_batch = torch.stack(observe_masks, dim=0)  # (N, To, H, W)
+        predict_mask_batch = torch.stack(predict_masks, dim=0)  # (N, Tp, H, W)
+    else:
+        observe_clips, predict_clips = zip(*batch_data)
+        observe_batch = torch.stack(observe_clips, dim=0)
+        predict_batch = torch.stack(predict_clips, dim=0)
+        observe_mask_batch = None
+        predict_mask_batch = None
 
     #output the last frame of observation, taken as the first frame of autoregressive prediction
     observe_last_batch = observe_batch[:, -1:, ...]
@@ -616,20 +803,40 @@ def svrfcn(batch_data, rand_Tp = 3, rand_predict = True, o_resize = None, p_resi
         rand_idx = np.sort(np.random.choice(max_Tp, rand_Tp, replace=False))
         rand_idx = torch.from_numpy(rand_idx)
         rand_predict_batch = predict_batch[:, rand_idx, ...]
+        # Apply same random sampling to masks if they exist
+        if has_masks:
+            rand_predict_mask_batch = predict_mask_batch[:, rand_idx.long(), ...]  # (N, rand_Tp, H, W)
+        else:
+            rand_predict_mask_batch = None
     else:
         rand_idx = torch.linspace(0, max_Tp-1, max_Tp, dtype = torch.int)
         rand_predict_batch = predict_batch
+        if has_masks:
+            rand_predict_mask_batch = predict_mask_batch
+        else:
+            rand_predict_mask_batch = None
+    
     To = observe_batch.shape[1]
     idx_o = torch.linspace(0, To-1 , To, dtype = torch.int)
+    
+    if has_masks:
+        observe_last_mask_batch = observe_mask_batch[:, -1:, ...]  # (N, 1, H, W)
+    else:
+        observe_last_mask_batch = None
 
     if half_fps:
         if observe_batch.shape[1] > 2:
             observe_batch = observe_batch[:, ::2, ...]
             idx_o = idx_o[::2, ...]
+            if has_masks:
+                observe_mask_batch = observe_mask_batch[:, ::2, ...]
+                observe_last_mask_batch = observe_mask_batch[:, -1:, ...]
 
         rand_predict_batch = rand_predict_batch[:, ::2, ...]
         rand_idx = rand_idx[::2, ...]
         observe_last_batch = observe_batch[:, -1:, ...]
+        if has_masks:
+            rand_predict_mask_batch = rand_predict_mask_batch[:, ::2, ...]
 
     if p_resize is not None:
         N, T, _, _, _ = rand_predict_batch.shape
@@ -638,12 +845,43 @@ def svrfcn(batch_data, rand_Tp = 3, rand_predict = True, o_resize = None, p_resi
         #als resize the last frame of observation
         observe_last_batch = p_resize(observe_last_batch.flatten(0, 1))
         observe_last_batch = rearrange(observe_last_batch, "(N T) C H W -> N T C H W", N = N, T=1)
+        # Resize masks if they exist
+        if has_masks:
+            N_mask, T_mask, H_mask, W_mask = rand_predict_mask_batch.shape
+            rand_predict_mask_batch = torch.nn.functional.interpolate(
+                rand_predict_mask_batch.flatten(0, 1).float().unsqueeze(1),
+                size=(rand_predict_batch.shape[3], rand_predict_batch.shape[4]),
+                mode='nearest'
+            ).squeeze(1).bool()
+            rand_predict_mask_batch = rearrange(rand_predict_mask_batch, "(N T) H W -> N T H W", N = N_mask, T=T_mask)
+            
+            observe_last_mask_batch = torch.nn.functional.interpolate(
+                observe_last_mask_batch.flatten(0, 1).float().unsqueeze(1),
+                size=(rand_predict_batch.shape[3], rand_predict_batch.shape[4]),
+                mode='nearest'
+            ).squeeze(1).bool()
+            observe_last_mask_batch = rearrange(observe_last_mask_batch, "(N T) H W -> N T H W", N = N_mask, T=1)
         
     if o_resize is not None:
         N, T, _, _, _ = observe_batch.shape
         observe_batch = o_resize(observe_batch.flatten(0, 1))
         observe_batch = rearrange(observe_batch, "(N T) C H W -> N T C H W", N = N, T=T)
-    return (observe_batch, rand_predict_batch, observe_last_batch, idx_o.to(torch.float), rand_idx.to(torch.float) + To)
+        # Also resize masks if they exist
+        if has_masks:
+            N_mask, T_mask, H_mask, W_mask = observe_mask_batch.shape
+            observe_mask_batch = torch.nn.functional.interpolate(
+                observe_mask_batch.flatten(0, 1).float().unsqueeze(1), 
+                size=(observe_batch.shape[3], observe_batch.shape[4]), 
+                mode='nearest'
+            ).squeeze(1).bool()
+            observe_mask_batch = rearrange(observe_mask_batch, "(N T) H W -> N T H W", N = N_mask, T=T_mask)
+    
+    # Return with or without masks
+    if has_masks:
+        return (observe_batch, rand_predict_batch, observe_last_batch, idx_o.to(torch.float), rand_idx.to(torch.float) + To, 
+                observe_mask_batch, rand_predict_mask_batch, observe_last_mask_batch)
+    else:
+        return (observe_batch, rand_predict_batch, observe_last_batch, idx_o.to(torch.float), rand_idx.to(torch.float) + To)
 
 #####################################################################################
 class VidResize(object):
@@ -713,6 +951,62 @@ class VidToTensor(object):
         clip = torch.stack(clip, dim = 0)
 
         return clip
+
+class NumpyToTensor(object):
+    """Convert numpy array directly to tensor (for KITTI_RANGE, preserves original values)"""
+    def __call__(self, clip: List[np.ndarray]):
+        """
+        Args:
+            clip: List of numpy arrays, each with shape (H, W)
+        Returns:
+            Tensor with shape (T, C, H, W) where C=1
+        """
+        tensors = []
+        for arr in clip:
+            # Convert numpy to tensor (preserves values exactly)
+            tensor = torch.from_numpy(arr.astype(np.float32))
+            # Add channel dimension: (H, W) -> (1, H, W)
+            tensor = tensor.unsqueeze(0)
+            tensors.append(tensor)
+        # Stack along time dimension: (T, C, H, W)
+        return torch.stack(tensors, dim=0)
+
+class VidResizeTensor(object):
+    """Resize tensor directly (for KITTI_RANGE)"""
+    def __init__(self, *args, **resize_kwargs):
+        self.resize_kwargs = resize_kwargs
+        self.resize_kwargs['antialias'] = True
+        self.resize_kwargs['interpolation'] = transforms.InterpolationMode.BICUBIC
+        self.args = args
+
+    def __call__(self, clip: torch.Tensor):
+        """
+        Args:
+            clip: Tensor with shape (T, C, H, W)
+        Returns:
+            Resized tensor with shape (T, C, H_new, W_new)
+        """
+        T, C, H, W = clip.shape
+        resized_clip = []
+        for t in range(T):
+            # Resize each frame: (C, H, W) -> (C, H_new, W_new)
+            frame = transforms.Resize(*self.args, **self.resize_kwargs)(clip[t])
+            resized_clip.append(frame)
+        return torch.stack(resized_clip, dim=0)
+
+class MeanCenterTransform(object):
+    """Mean centering transform (subtract mean, no scaling)"""
+    def __init__(self, mean):
+        self.mean = mean
+    
+    def __call__(self, clip: torch.Tensor):
+        """
+        Args:
+            clip: Tensor with shape (T, C, H, W)
+        Returns:
+            Mean-centered tensor: clip - mean
+        """
+        return clip - self.mean
 
 class VidNormalize(object):
     def __init__(self, mean, std):
@@ -836,6 +1130,233 @@ def get_data_inverse_scaler(config):
     return lambda x: (x + 1.) / 2.
   else:
     return lambda x: x
+
+class RangeImageClipDataset(Dataset):
+    """
+    Video clips dataset for range images stored as .npy files
+    """
+    def __init__(self, num_observed_frames, num_predict_frames, clips, transform, color_mode, global_min=None, global_max=None):
+        """
+        Args:
+            num_observed_frames --- number of past frames
+            num_predict_frames --- number of future frames
+            clips --- List of video clips frames file path (.npy files)
+            transform --- torchvision transforms for the image
+            color_mode --- 'grey_scale' for range images (single channel)
+            global_min --- Global minimum value for normalization (if None, uses per-image min)
+            global_max --- Global maximum value for normalization (if None, uses per-image max)
+
+        Return batched Sample:
+            past_clip --- Tensor with shape (batch_size, num_observed_frames, C, H, W)
+            future_clip --- Tensor with shape (batch_size, num_predict_frames, C, H, W)
+        """
+        self.num_observed_frames = num_observed_frames
+        self.num_predict_frames = num_predict_frames
+        self.clips = clips
+        self.transform = transform
+        if color_mode != 'grey_scale':
+            raise ValueError("Range images must use 'grey_scale' color mode!")
+        self.color_mode = color_mode
+        self.global_min = global_min
+        self.global_max = global_max
+
+    def __len__(self):
+        return len(self.clips)
+    
+    def __getitem__(self, index: int):
+        """
+        Returns:
+            past_clip: Tensor with shape (num_observed_frames, C, H, W)
+            future_clip: Tensor with shape (num_predict_frames, C, H, W)
+        """
+        if torch.is_tensor(index):
+            index = index.to_list()
+        
+        clip_files = self.clips[index]
+        range_imgs = []  # List of PIL Images
+        valid_masks_raw = []  # Store original valid masks before transforms
+        
+        for npy_path in clip_files:
+            # Load .npy file
+            range_img = np.load(npy_path.absolute().as_posix())
+            
+            # Ensure 2D array (H, W)
+            if len(range_img.shape) > 2:
+                range_img = range_img.squeeze()
+            
+            # Ensure float32 dtype
+            range_img = range_img.astype(np.float32)
+            
+            # Handle invalid pixels (typically -1 or negative values)
+            # Store valid mask BEFORE processing (for loss masking)
+            valid_mask = range_img > 0
+            valid_masks_raw.append(valid_mask.copy())
+            
+            # Set invalid pixels to 0 (keep original values for valid pixels)
+            range_img[~valid_mask] = 0.0
+            
+            # Global min-max normalization: normalize to [0, 1] using global min/max
+            if self.global_min is not None and self.global_max is not None and self.global_max > self.global_min:
+                # Use global min/max for normalization
+                range_img[valid_mask] = (range_img[valid_mask] - self.global_min) / (self.global_max - self.global_min)
+            else:
+                # Fallback to per-image normalization if global min/max not provided
+                img_min = range_img[valid_mask].min() if valid_mask.any() else 0.0
+                img_max = range_img[valid_mask].max() if valid_mask.any() else 1.0
+                if img_max > img_min:
+                    range_img[valid_mask] = (range_img[valid_mask] - img_min) / (img_max - img_min)
+            
+            # Convert to PIL Image (expects uint8 in [0, 255] range)
+            # Scale from [0, 1] to [0, 255] and convert to uint8
+            range_img_uint8 = (range_img * 255.0).astype(np.uint8)
+            pil_img = Image.fromarray(range_img_uint8, mode='L')
+            range_imgs.append(pil_img)
+        
+        # Apply transforms (VidResize -> VidToTensor -> norm_transform)
+        original_clip = self.transform(range_imgs)  # (T, C, H, W)
+        
+        # Resize valid masks to match transformed image size
+        # After transforms, images are (T, C, H, W)
+        T, C, H, W = original_clip.shape
+        valid_masks_tensor = torch.zeros((T, H, W), dtype=torch.bool)
+        
+        for i, mask in enumerate(valid_masks_raw):
+            # Get original image dimensions
+            orig_h, orig_w = mask.shape
+            # Resize mask to match transformed image size using nearest neighbor
+            mask_tensor = torch.from_numpy(mask).float().unsqueeze(0).unsqueeze(0)  # (1, 1, H_orig, W_orig)
+            if orig_h != H or orig_w != W:
+                mask_resized = torch.nn.functional.interpolate(
+                    mask_tensor, size=(H, W), mode='nearest'
+                ).squeeze()  # (H, W)
+            else:
+                mask_resized = mask_tensor.squeeze()  # (H, W)
+            valid_masks_tensor[i] = mask_resized.bool()
+
+        past_clip = original_clip[0:self.num_observed_frames, ...]
+        future_clip = original_clip[-self.num_predict_frames:, ...]
+        past_valid_mask = valid_masks_tensor[0:self.num_observed_frames, ...]  # (To, H, W)
+        future_valid_mask = valid_masks_tensor[-self.num_predict_frames:, ...]  # (Tp, H, W)
+        
+        return past_clip, future_clip, past_valid_mask, future_valid_mask
+
+
+class KITTIRangeImageDataset(object):
+    """
+    KITTI Range Image dataset, a wrapper for RangeImageClipDataset
+    Range images are stored as .npy files in sequence folders
+    Structure: KITTI_dir/{sequence_id}/processed/range/*.npy
+    """
+    def __init__(self, KITTI_dir, test_folder_ids, transform, train, val,
+                 num_observed_frames, num_predict_frames, global_min=None, global_max=None):
+        """
+        Args:
+            KITTI_dir --- Directory for KITTI range images (e.g., /scratch/pydah/kitti/processed_data)
+            test_folder_ids --- List of folder indices to use for testing (e.g., [10, 11, 12, 13])
+            train --- True for training dataset, False for test dataset
+            val --- True if validation split is needed
+            transform --- torchvision transform functions
+            num_observed_frames --- number of past frames
+            num_predict_frames --- number of future frames
+            global_min --- Global minimum value for normalization (if None, uses per-image min)
+            global_max --- Global maximum value for normalization (if None, uses per-image max)
+        """
+        self.num_observed_frames = num_observed_frames
+        self.num_predict_frames = num_predict_frames
+        self.clip_length = num_observed_frames + num_predict_frames
+        self.transform = transform
+        self.color_mode = 'grey_scale'  # Range images are grayscale
+        self.global_min = global_min
+        self.global_max = global_max
+
+        self.KITTI_path = Path(KITTI_dir).absolute()
+        self.train = train
+        self.val = val
+
+        # Get all sequence folders (00, 01, 02, etc.)
+        self.all_folders = sorted([f for f in os.listdir(self.KITTI_path) 
+                                   if os.path.isdir(self.KITTI_path / f) and f.isdigit()])
+        self.num_examples = len(self.all_folders)
+        
+        self.folder_id = list(range(self.num_examples))
+        if self.train:
+            # Get all folders except test folders
+            self.train_folders = [self.all_folders[i] for i in range(self.num_examples) if i not in test_folder_ids]
+            # Only split for validation if val=True AND we have enough sequences
+            if self.val and len(self.train_folders) > 2:
+                # Use first 2 sequences for validation, rest for training
+                self.val_folders = self.train_folders[0:2]
+                self.train_folders = self.train_folders[2:]
+            elif self.val:
+                # If we have 2 or fewer sequences, use all for training, none for validation
+                self.val_folders = []
+                # Keep all train_folders for training
+        else:
+            self.test_folders = [self.all_folders[i] for i in test_folder_ids]
+        
+        if self.train:
+            self.train_clips = self.__getClips__(self.train_folders)
+            if self.val and len(self.val_folders) > 0:
+                self.val_clips = self.__getClips__(self.val_folders)
+            else:
+                self.val_clips = []
+        else:
+            self.test_clips = self.__getClips__(self.test_folders)
+
+    def __call__(self):
+        """
+        Returns:
+            clip_set --- RangeImageClipDataset object
+        """
+        if self.train:
+            clip_set = RangeImageClipDataset(self.num_observed_frames, self.num_predict_frames, 
+                                            self.train_clips, self.transform, self.color_mode,
+                                            global_min=self.global_min, global_max=self.global_max)
+            if self.val and len(self.val_clips) > 0:
+                val_clip_set = RangeImageClipDataset(self.num_observed_frames, self.num_predict_frames, 
+                                                    self.val_clips, self.transform, self.color_mode,
+                                                    global_min=self.global_min, global_max=self.global_max)
+                return clip_set, val_clip_set
+            return clip_set
+        else:
+            return RangeImageClipDataset(self.num_observed_frames, self.num_predict_frames, 
+                                        self.test_clips, self.transform, self.color_mode,
+                                        global_min=self.global_min, global_max=self.global_max)
+    
+    def __getClips__(self, frame_folders):
+        """
+        Get clips from sequence folders
+        Structure: {sequence_id}/processed/range/*.npy
+        """
+        clips = []
+        for folder in frame_folders:
+            # Path to range images: {sequence_id}/processed/range/
+            range_dir = self.KITTI_path.joinpath(folder, "processed", "range")
+            
+            if not range_dir.exists():
+                print(f"Warning: Range directory not found: {range_dir}")
+                continue
+            
+            # Get all .npy files and sort them
+            npy_files = sorted(list(range_dir.glob("*.npy")))
+            
+            if len(npy_files) == 0:
+                print(f"Warning: No .npy files found in {range_dir}")
+                continue
+            
+            # Calculate number of clips
+            clip_num = len(npy_files) // self.clip_length
+            rem_num = len(npy_files) % self.clip_length
+            
+            # Remove remainder frames from start (centered)
+            npy_files = npy_files[rem_num // 2 : rem_num//2 + clip_num*self.clip_length]
+            
+            # Create clips
+            for i in range(clip_num):
+                clips.append(npy_files[i*self.clip_length : (i+1)*self.clip_length])
+
+        return clips
+
 
 def visualize_batch_clips(gt_past_frames_batch, gt_future_frames_batch, pred_frames_batch, file_dir, renorm_transform = None, desc = None):
     """

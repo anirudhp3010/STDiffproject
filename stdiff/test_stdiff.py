@@ -13,7 +13,7 @@ from hydra import compose, initialize
 from omegaconf import DictConfig, omegaconf
 from einops import rearrange
 
-from utils import visualize_batch_clips, eval_metrics
+from utils import visualize_batch_clips, eval_metrics, LitDataModule
 from pathlib import Path
 import argparse
 from models import STDiffPipeline, STDiffDiffusers
@@ -35,25 +35,96 @@ def main(cfg : DictConfig) -> None:
     if not Path(r_save_path).exists():
         Path(r_save_path).mkdir(parents=True, exist_ok=True) 
 
-    #load stdiff model
-    stdiff = STDiffDiffusers.from_pretrained(ckpt_path, subfolder='stdiff').eval()
+    # Handle checkpoint loading - support both checkpoint directories and model directories
+    # If ckpt_path points to a checkpoint directory (e.g., checkpoint-6), load from unet subfolder
+    # Otherwise, load from stdiff subfolder (legacy format)
+    checkpoint_dir = Path(ckpt_path)
+    if checkpoint_dir.is_dir() and checkpoint_dir.name.startswith('checkpoint-'):
+        # Loading from a training checkpoint directory
+        unet_path = checkpoint_dir / 'unet'
+        if unet_path.exists():
+            print(f"Loading model from checkpoint directory: {ckpt_path}/unet")
+            stdiff = STDiffDiffusers.from_pretrained(str(unet_path)).eval()
+        else:
+            raise FileNotFoundError(f"Model not found in checkpoint directory: {unet_path}")
+    else:
+        # Legacy format: loading from model directory with stdiff subfolder
+        stdiff = STDiffDiffusers.from_pretrained(ckpt_path, subfolder='stdiff').eval()
     #Print the number of parameters
     num_params = sum(p.numel() for p in stdiff.parameters() if p.requires_grad)
     print('Number of parameters is: ', num_params)
+    
+    # Enable gradient checkpointing if configured
+    if cfg.TestCfg.gradient_checkpointing:
+        # Enable gradient checkpointing on the UNet blocks
+        def enable_gc_recursive(module):
+            if hasattr(module, 'gradient_checkpointing'):
+                module.gradient_checkpointing = True
+            for child in module.children():
+                enable_gc_recursive(child)
+        
+        enable_gc_recursive(stdiff.diffusion_unet)
+        print("Gradient checkpointing enabled for inference")
+    
+    # Enable xformers memory efficient attention if configured
+    if cfg.TestCfg.use_xformers:
+        try:
+            stdiff.enable_xformers_memory_efficient_attention()
+            print("XFormers memory efficient attention enabled")
+        except Exception as e:
+            print(f"Warning: Failed to enable xformers: {e}. Continuing without xformers.")
 
-    #init scheduler
-    if cfg.TestCfg.scheduler.name == 'DDPM':
-        scheduler = DDPMScheduler.from_pretrained(ckpt_path, subfolder = 'scheduler')
-    elif cfg.TestCfg.scheduler.name == 'DPMMS':
-        scheduler = DPMSolverMultistepScheduler.from_pretrained(ckpt_path, subfolder="scheduler", solver_order=3)
+    #init scheduler - handle both checkpoint directories and model directories
+    checkpoint_dir = Path(ckpt_path)
+    if checkpoint_dir.is_dir() and checkpoint_dir.name.startswith('checkpoint-'):
+        # Loading from a training checkpoint directory
+        # Checkpoints save scheduler.bin directly in checkpoint dir, or we create from config
+        scheduler_bin = checkpoint_dir / 'scheduler.bin'
+        scheduler_dir = checkpoint_dir / 'scheduler'
+        
+        # For testing, we typically want a fresh scheduler with inference settings
+        # Create scheduler from config (this is more appropriate for inference)
+        print(f"Creating scheduler from config for inference")
+        if cfg.TestCfg.scheduler.name == 'DDPM':
+            scheduler = DDPMScheduler(
+                num_train_timesteps=cfg.STDiff.Diffusion.ddpm_num_steps,
+                beta_schedule=cfg.STDiff.Diffusion.ddpm_beta_schedule,
+                prediction_type=cfg.STDiff.Diffusion.prediction_type,
+            )
+        elif cfg.TestCfg.scheduler.name == 'DPMMS':
+            # First load base DDPM scheduler config
+            base_scheduler = DDPMScheduler(
+                num_train_timesteps=cfg.STDiff.Diffusion.ddpm_num_steps,
+                beta_schedule=cfg.STDiff.Diffusion.ddpm_beta_schedule,
+                prediction_type=cfg.STDiff.Diffusion.prediction_type,
+            )
+            scheduler = DPMSolverMultistepScheduler.from_config(base_scheduler.config, solver_order=3)
+        else:
+            raise NotImplementedError("Scheduler is not supported")
     else:
-        raise NotImplementedError("Scheduler is not supported")
+        # Legacy format: loading from model directory
+        if cfg.TestCfg.scheduler.name == 'DDPM':
+            scheduler = DDPMScheduler.from_pretrained(ckpt_path, subfolder = 'scheduler')
+        elif cfg.TestCfg.scheduler.name == 'DPMMS':
+            scheduler = DPMSolverMultistepScheduler.from_pretrained(ckpt_path, subfolder="scheduler", solver_order=3)
+        else:
+            raise NotImplementedError("Scheduler is not supported")
 
     stdiff_pipeline = STDiffPipeline(stdiff, scheduler).to(device)
     if not accelerator.is_main_process:
         stdiff_pipeline.disable_pgbar()
-    _, _, test_loader = get_lightning_module_dataloader(cfg)
+    
+    _, _, test_loader, pl_datamodule = get_lightning_module_dataloader(cfg)
     stdiff_pipeline, test_loader = accelerator.prepare(stdiff_pipeline, test_loader)
+    
+    # Get global min/max for KITTI_RANGE (for evaluation)
+    global_min = None
+    global_max = None
+    if cfg.Dataset.name == 'KITTI_RANGE':
+        global_min = getattr(pl_datamodule, 'range_image_global_min', None)
+        global_max = getattr(pl_datamodule, 'range_image_global_max', None)
+        if global_min is not None and global_max is not None:
+            print(f"Using global min/max for evaluation: [{global_min:.6f}, {global_max:.6f}]")
 
     To = cfg.Dataset.test_num_observed_frames
     assert To == cfg.Dataset.num_observed_frames, 'invalid configuration'
@@ -95,7 +166,16 @@ def main(cfg : DictConfig) -> None:
         progress_bar.set_description(f"Testing...") 
         for idx, batch in enumerate(test_loader):
             if idx > resume_batch_idx: #resume test
-                Vo, Vp, Vo_last_frame, _, _ = batch
+                # Handle both regular datasets and range image datasets (with masks)
+                if len(batch) == 8:  # Range images with masks (KITTI_RANGE)
+                    Vo, Vp, Vo_last_frame, idx_o_batch, idx_p_batch, Vo_mask, Vp_mask, Vo_last_mask = batch
+                    has_masks = True
+                else:  # Regular datasets without masks
+                    Vo, Vp, Vo_last_frame, idx_o_batch, idx_p_batch = batch
+                    has_masks = False
+                    Vo_mask = None
+                    Vp_mask = None
+                    Vo_last_mask = None
 
                 preds = []
                 if cfg.TestCfg.random_predict.first_pred_sample_num >= 2:
@@ -104,18 +184,26 @@ def main(cfg : DictConfig) -> None:
                                                                             num_inference_steps = cfg.TestCfg.scheduler.sample_steps,
                                                                             fix_init_noise=cfg.TestCfg.random_predict.fix_init_noise,
                                                                             bs = cfg.TestCfg.random_predict.first_pred_parralle_bs)
+                
                 for i in range(cfg.TestCfg.random_predict.sample_num):
                     pred_clip = []
                     Vo_input = Vo.clone()
+                    # Reset Vo_last_frame for each new trajectory (sample)
+                    Vo_last_frame_iter = Vo_last_frame.clone()
                     for j in range(autoreg_iter):
                         if j == 0 and cfg.TestCfg.random_predict.first_pred_sample_num >= 2:
                             temp_pred = stdiff_pipeline.pred_remainig_frames(*(filter_first_out + (cfg.TestCfg.random_predict.fix_init_noise,"pil", False)))
                         else:
-                            temp_pred = stdiff_pipeline(Vo_input, Vo_last_frame, idx_o, idx_p, num_inference_steps = cfg.TestCfg.scheduler.sample_steps,
-                                                    to_cpu=False, fix_init_noise=cfg.TestCfg.random_predict.fix_init_noise) #Torch Tensor (N, Tp, C, H, W), range (0, 1)
+                            temp_pred = stdiff_pipeline(Vo_input, Vo_last_frame_iter, idx_o, idx_p, num_inference_steps = cfg.TestCfg.scheduler.sample_steps,
+                                                    to_cpu=False, fix_init_noise=cfg.TestCfg.random_predict.fix_init_noise) #Torch Tensor (N, Tp, C, H, W), range [0, 1]
                         pred_clip.append(temp_pred)
-                        Vo_input = temp_pred[:, -To:, ...]*2. - 1.
-                        Vo_last_frame = temp_pred[:, -1:, ...]*2. -1.
+                        # Convert from [0, 1] to [-1, 1] for next autoregressive iteration
+                        temp_pred_clamped = temp_pred.clamp(0, 1)
+                        Vo_input = temp_pred_clamped[:, -To:, ...]*2. - 1.
+                        Vo_last_frame_iter = temp_pred_clamped[:, -1:, ...]*2. - 1.
+                        # Clamp to [-1, 1] to ensure valid range for next iteration
+                        Vo_input = Vo_input.clamp(-1, 1)
+                        Vo_last_frame_iter = Vo_last_frame_iter.clamp(-1, 1)
 
                     pred_clip = torch.cat(pred_clip, dim = 1)
                     if autoreg_rem > 0:
@@ -124,19 +212,35 @@ def main(cfg : DictConfig) -> None:
                     
                 preds = torch.stack(preds, 0) #(sample_num, N, Tp, C, H, W)
                 preds = preds.permute(1, 0, 2, 3, 4, 5).contiguous() #(N, sample_num, num_predict_frames, C, H, W)
-                Vo = (Vo / 2 + 0.5).clamp(0, 1)
-                Vp = (Vp / 2 + 0.5).clamp(0, 1)
+                preds = preds.clamp(0, 1)
+                
+                # Denormalize Vo and Vp for visualization
+                Vo_vis = (Vo / 2 + 0.5).clamp(0, 1)
+                Vp_vis = (Vp / 2 + 0.5).clamp(0, 1)
 
                 g_preds = accelerator.gather(preds)
                 g_Vo = accelerator.gather(Vo)
                 g_Vp = accelerator.gather(Vp)
+                
+                # Gather masks if available (for KITTI_RANGE)
+                if has_masks:
+                    g_Vp_mask = accelerator.gather(Vp_mask)
+                else:
+                    g_Vp_mask = None
 
                 if accelerator.is_main_process:
                     dump_obj = {'Vo': g_Vo.detach().cpu(), 'g_Vp': g_Vp.detach().cpu(), 'g_Preds': g_preds.detach().cpu()}
+                    # Add mask for ground truth predictions (Vp_mask) if available
+                    if g_Vp_mask is not None:
+                        dump_obj['g_Vp_mask'] = g_Vp_mask.detach().cpu()
+                    # Add global min/max for KITTI_RANGE (for evaluation)
+                    if cfg.Dataset.name == 'KITTI_RANGE' and global_min is not None and global_max is not None:
+                        dump_obj['global_min'] = global_min
+                        dump_obj['global_max'] = global_max
                     torch.save(dump_obj, f=Path(r_save_path).joinpath(f'Preds_{idx}.pt'))
                     progress_bar.update(1)
                     for i  in range(min(cfg.TestCfg.random_predict.sample_num, 4)):
-                        visualize_batch_clips(Vo, Vp, preds[:, i, ...], file_dir=Path(r_save_path).joinpath(f'test_examples_{idx}_traj{i}'))
+                        visualize_batch_clips(Vo_vis, Vp_vis, preds[:, i, ...], file_dir=Path(r_save_path).joinpath(f'test_examples_{idx}_traj{i}'))
 
                     del g_Vo
                     del g_Vp

@@ -1,2 +1,4 @@
-
+__pycache__/
+*.log
+STDiff_ckpts/
 .DS_Store

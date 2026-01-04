@@ -86,11 +86,16 @@ class STDiffPipeline(DiffusionPipeline):
 
         if not self.stdiff.autoreg:
             # Sample gaussian noise to begin loop
+            # Handle both square (int) and non-square (list/tuple/ListConfig) sample_size
+            if isinstance(self.stdiff.diffusion_unet.sample_size, (list, tuple)) or hasattr(self.stdiff.diffusion_unet.sample_size, '__getitem__') and hasattr(self.stdiff.diffusion_unet.sample_size, '__len__'):
+                sample_h, sample_w = int(self.stdiff.diffusion_unet.sample_size[0]), int(self.stdiff.diffusion_unet.sample_size[1])
+            else:
+                sample_h = sample_w = self.stdiff.diffusion_unet.sample_size
             if fix_init_noise:
-                image_shape = (Vo.shape[0], self.stdiff.diffusion_unet.in_channels, self.stdiff.diffusion_unet.sample_size, self.stdiff.diffusion_unet.sample_size)
+                image_shape = (Vo.shape[0], self.stdiff.diffusion_unet.in_channels, sample_h, sample_w)
             else:
                 batch_size = Vo.shape[0]*idx_p.shape[0]
-                image_shape = (batch_size, self.stdiff.diffusion_unet.in_channels, self.stdiff.diffusion_unet.sample_size, self.stdiff.diffusion_unet.sample_size)
+                image_shape = (batch_size, self.stdiff.diffusion_unet.in_channels, sample_h, sample_w)
                 
             image = self.init_noise(image_shape, generator)
             if fix_init_noise:
@@ -115,7 +120,12 @@ class STDiffPipeline(DiffusionPipeline):
         
         else:
             # Sample gaussian noise to begin loop
-            image_shape = (Vo.shape[0], self.stdiff.diffusion_unet.out_channels, self.stdiff.diffusion_unet.sample_size, self.stdiff.diffusion_unet.sample_size)
+            # Handle both square (int) and non-square (list/tuple/ListConfig) sample_size
+            if isinstance(self.stdiff.diffusion_unet.sample_size, (list, tuple)) or hasattr(self.stdiff.diffusion_unet.sample_size, '__getitem__') and hasattr(self.stdiff.diffusion_unet.sample_size, '__len__'):
+                sample_h, sample_w = int(self.stdiff.diffusion_unet.sample_size[0]), int(self.stdiff.diffusion_unet.sample_size[1])
+            else:
+                sample_h = sample_w = self.stdiff.diffusion_unet.sample_size
+            image_shape = (Vo.shape[0], self.stdiff.diffusion_unet.out_channels, sample_h, sample_w)
             
             # set step values
             self.scheduler.set_timesteps(num_inference_steps)
@@ -195,7 +205,12 @@ class STDiffPipeline(DiffusionPipeline):
                                fix_init_noise=False,
                                bs = 4):
         # Sample gaussian noise to begin loop
-        image_shape = (Vo.shape[0], self.stdiff.diffusion_unet.out_channels, self.stdiff.diffusion_unet.sample_size, self.stdiff.diffusion_unet.sample_size)
+        # Handle both square (int) and non-square (list/tuple) sample_size
+        if isinstance(self.stdiff.diffusion_unet.sample_size, (list, tuple)):
+            sample_h, sample_w = self.stdiff.diffusion_unet.sample_size[0], self.stdiff.diffusion_unet.sample_size[1]
+        else:
+            sample_h = sample_w = self.stdiff.diffusion_unet.sample_size
+        image_shape = (Vo.shape[0], self.stdiff.diffusion_unet.out_channels, sample_h, sample_w)
         
         # set step values
         self.scheduler.set_timesteps(num_inference_steps)
@@ -220,7 +235,7 @@ class STDiffPipeline(DiffusionPipeline):
             image = image.repeat(rn, 1, 1, 1)
             for t in self.progress_bar(self.scheduler.timesteps):
                 # 1. predict noise model_output
-                model_output = self.stdiff.diffusion_unet(torch.cat([image, prev_frame.repeat(rn, 1, 1, 1)], dim = 1), t, m_feat = m_first.flatten(0, 1)).sample
+                model_output = self.stdiff.diffusion_unet(torch.cat([image, prev_frame.repeat(rn, 1, 1, 1).clamp(-1, 1)], dim = 1), t, m_feat = m_first.flatten(0, 1)).sample
 
                 # 2. compute previous image: x_t -> x_t-1
                 #image = self.scheduler.step(model_output, t, image, generator=generator).prev_sample
@@ -229,9 +244,13 @@ class STDiffPipeline(DiffusionPipeline):
             #first_preds.append(rearrange(image, '(N r) C H W -> N r C H W', N=m_first.shape[0], r=rn))
         first_preds = torch.cat(first_preds, dim = 0)
         
-        #calculate the PSNR, SSIM of first frames
-        ssim = SSIM()(Vp_first_frame[:, 0, ...].repeat(first_pred_sample_num, 1, 1, 1), first_preds, mean_flag=False)
-        psnr = PSNR(Vp_first_frame[:, 0, ...].repeat(first_pred_sample_num, 1, 1, 1), first_preds, mean_flag=False)
+        # Normalize both to [0, 1] for fair SSIM/PSNR comparison
+        first_preds_norm = (first_preds / 2 + 0.5).clamp(0, 1)
+        Vp_first_norm = (Vp_first_frame[:, 0, ...] / 2 + 0.5).clamp(0, 1)
+        
+        #calculate the PSNR, SSIM of first frames (using normalized [0, 1] range)
+        ssim = SSIM()(Vp_first_norm.repeat(first_pred_sample_num, 1, 1, 1), first_preds_norm, mean_flag=False)
+        psnr = PSNR(Vp_first_norm.repeat(first_pred_sample_num, 1, 1, 1), first_preds_norm, mean_flag=False)
         ssim = ssim.reshape(Vp_first_frame.shape[0], first_pred_sample_num)
         psnr = psnr.reshape(Vp_first_frame.shape[0], first_pred_sample_num)
         merge_metric = ssim+psnr
@@ -253,6 +272,15 @@ class STDiffPipeline(DiffusionPipeline):
                              output_type: Optional[str] = "pil", to_cpu=True):
         m_future = self.stdiff.tde_model.future_predict(best_m_first, idx_p) #(Tp-1, N, C, H, W)
         image = self.init_noise(image_shape, generator)
+        
+        # Ensure best_first_preds is in [-1, 1] range (from scheduler.step().prev_sample)
+        # Check if it's accidentally in [0, 1] range and convert back to [-1, 1] to avoid double denormalization
+        best_first_min, best_first_max = best_first_preds.min().item(), best_first_preds.max().item()
+        if best_first_min >= -0.05 and best_first_max <= 1.05 and best_first_min >= 0.0:
+            # Likely in [0, 1] range (shouldn't happen, but safeguard), convert to [-1, 1]
+            print(f"[WARNING] best_first_preds appears to be in [0, 1] range [{best_first_min:.4f}, {best_first_max:.4f}], converting to [-1, 1]")
+            best_first_preds = best_first_preds * 2.0 - 1.0
+        
         imgs = [best_first_preds]
         for tp in range(1, idx_p.shape[0]):
             if tp == 1:
@@ -274,7 +302,6 @@ class STDiffPipeline(DiffusionPipeline):
             imgs.append(image)
 
         image = torch.stack(imgs, dim = 1).flatten(0, 1)
-
         image = (image / 2 + 0.5).clamp(0, 1)
         if output_type == "numpy":
             image = image.cpu().permute(0, 2, 3, 1).numpy()

@@ -93,4 +93,5 @@ Training:
     checkpointing_steps: 1000 #number of steps to save a resuming checkpoint
 
     gradient_accumulation_steps: 1 #4 for 128 resolution, 4 GPU training
-    mixed_precision: "no" #["no", "fp16", "bf16"],
+    mixed_precision: "no" #["no", "fp16", "bf16"]
+    gradient_checkpointing: False  # Enable to save memory at the cost of slower training

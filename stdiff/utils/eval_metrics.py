@@ -35,8 +35,10 @@ def eval_metrics(cfg : DictConfig) -> None:
         for file in tqdm(preds_files):
             f = torch.load(file)
             Vo_batch, Vp_batch, preds_batch = f['Vo'], f['g_Vp'], f['g_Preds']
-            Vp_batch = Vp_batch[:, 0:17, ...]
-            preds_batch = preds_batch[:, :, 0:17, ...]
+            # Use actual number of frames from the data, not hardcoded 17
+            num_frames = min(Vp_batch.shape[1], preds_batch.shape[2])
+            Vp_batch = Vp_batch[:, 0:num_frames, ...]
+            preds_batch = preds_batch[:, :, 0:num_frames, ...]
             print(Vo_batch.shape, Vp_batch.shape, preds_batch.shape)
 
             bs = 16

@@ -18,11 +18,21 @@ class FVDFeatureExtractor(nn.Module):
     def __init__(self):
         super().__init__()
         self.i3d = load_i3d_pretrained()
+        self.min_temporal_frames = 16  # I3D needs at least 16 frames to avoid temporal dimension collapse in avg_pool3d
     
     def forward(self, x, return_numpy = False):
         N, T, C, _, _ = x.shape
         if C == 1:
             x = x.repeat(1, 1, 3, 1, 1)
+        
+        # Pad temporal dimension if video is too short for I3D
+        if T < self.min_temporal_frames:
+            # Repeat the last frame to pad to minimum required frames
+            num_pad = self.min_temporal_frames - T
+            last_frame = x[:, -1:, ...]  # (N, 1, C, H, W)
+            padding = last_frame.repeat(1, num_pad, 1, 1, 1)  # (N, num_pad, C, H, W)
+            x = torch.cat([x, padding], dim=1)  # (N, min_temporal_frames, C, H, W)
+        
         x = x.permute(0, 2, 1, 3, 4)
         embeddings = get_fvd_feats(x, i3d=self.i3d, bs=10)
         if not return_numpy:

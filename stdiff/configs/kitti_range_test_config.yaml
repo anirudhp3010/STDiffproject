@@ -1,0 +1,81 @@
+Dataset:
+    name: 'KITTI_RANGE'
+    dir: '/DATA/common/kitti/processed_data'
+    phase: 'deploy'
+    dev_set_size: null
+    batch_size: 1  # Reduced for range images
+    num_workers: 2
+    num_channels: 1  # Grayscale range images
+    image_size: [64, 512]  # Range images: 64 height x 512 width
+    num_observed_frames: 3
+    num_predict_frames: 3
+    test_num_observed_frames: 3
+    test_num_predict_frames: 3
+    rand_Tp: 3
+    rand_predict: True
+    half_fps: False
+    test_folder_ids: [9]  # Folder indices for testing
+
+STDiff:
+    Diffusion:
+        prediction_type: 'epsilon' #'epsilon' or 'sample'
+        ddpm_num_steps: 100
+        ddpm_num_inference_steps: 50
+        ddpm_beta_schedule: 'squaredcos_cap_v2'
+
+        unet_config:
+            sample_size: [64, 512]  # Non-square: 64 height x 512 width
+            in_channels: 2  # For autoregressive: 1 (current) + 1 (previous frame)
+            out_channels: 1  # Grayscale output
+            m_channels: 256
+            layers_per_block: 2
+            #config for resolution 64x512
+            block_out_channels: [128, 256, 512, 768, 1024]
+            down_block_types: ["DownBlock2D","AttnDownBlock2D","AttnDownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D"]
+            up_block_types: ["AttnUpBlock2D", "AttnUpBlock2D","AttnUpBlock2D", "AttnUpBlock2D", "UpBlock2D"]
+            attention_head_dim: [null, 32, 64, 192, 256]
+
+    DiffNet:
+        autoregressive: True
+        super_res_training: False
+        MotionEncoder:
+            learn_diff_image: True
+            image_size: [64, 512]  # Non-square: 64 height x 512 width
+            in_channels: 1  # Grayscale input
+            model_channels: 64
+            n_downs: 2
+        DiffUnet:
+            n_layers: 2
+            nonlinear: 'tanh'
+        Int:
+            sde: True
+            method: 'euler_heun'
+            sde_options:
+                noise_type: 'diagonal'
+                sde_type: "stratonovich" #"Stratonovich"
+                dt: 0.1
+                rtol: 1e-3
+                atol: 1e-3
+                adaptive: False
+            ode_options:
+                step_size: 0.1
+                norm: null
+
+TestCfg:
+    # Load from checkpoint-6 in the output directory
+    ckpt_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512/checkpoint-70400"
+    test_results_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512/test_results_checkpoint-70400_50steps"
+    gradient_checkpointing: False  # Enable to save memory during inference
+    use_xformers: False  # Enable xformers memory efficient attention (requires xformers package)
+    scheduler: 
+        name: 'DPMMS' #'DPMMS' or 'DDPM'
+        sample_steps: 50  # Match ddpm_num_inference_steps
+
+    fps: 1
+    metrics: ['PSNR', 'SSIM', 'LPIPS', 'InterLPIPS']
+    random_predict:
+        first_pred_sample_num: 3
+        first_pred_parralle_bs: 3
+        sample_num: 3
+        fix_init_noise: False
+

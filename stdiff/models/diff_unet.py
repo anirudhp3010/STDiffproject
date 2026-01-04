@@ -11,7 +11,7 @@ from einops import repeat, rearrange
 
 from torchdiffeq import odeint_adjoint as odeint
 from torchsde import sdeint_adjoint as sdeint 
-from omegaconf.omegaconf import open_dict
+from omegaconf.omegaconf import open_dict, ListConfig
 
 class DiffModel(nn.Module):
     def __init__(self, int_cfg, motion_encoder_cfg, diff_unet_cfg):
@@ -24,7 +24,13 @@ class DiffModel(nn.Module):
         self.learn_diff_image = self.motion_encoder_cfg.learn_diff_image
         n_downs = self.motion_encoder_cfg.n_downs
         image_size = self.motion_encoder_cfg.image_size
-        H = W = int(image_size/(2**n_downs))
+        # Handle both square (int) and non-square (list/tuple/ListConfig) image_size
+        if isinstance(image_size, (list, tuple, ListConfig)):
+            image_h, image_w = int(image_size[0]), int(image_size[1])
+            H = int(image_h/(2**n_downs))
+            W = int(image_w/(2**n_downs))
+        else:
+            H = W = int(image_size/(2**n_downs))
         motion_C = self.motion_encoder_cfg.model_channels*(2**n_downs)
         self.motion_feature_size = (motion_C, H, W)
 
@@ -72,7 +78,8 @@ class DiffModel(nn.Module):
     def future_predict(self, m_context, idx_p):
         """
         :param m_context: (N, C, H, W)
-        :param idx_p: (Tp+1, ), first element is the index of the motion context feature, i.e., last index of observed frames
+        :param idx_p: (Tp+1, ), first element is the index of the motion 
+        context feature, i.e., last index of observed frames
         Return:
             m_future: (Tp, N, C, H, W)
         """

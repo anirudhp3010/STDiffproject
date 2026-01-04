@@ -1,8 +1,14 @@
+import glob
 import inspect
 import logging
 import math
 import os
+import shutil
+import sys
 from pathlib import Path
+
+# Set memory management to reduce fragmentation BEFORE importing torch
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'max_split_size_mb:512')
 
 import accelerate
 import torch
@@ -23,6 +29,7 @@ from diffusers.utils import check_min_version, is_accelerate_version, is_tensorb
 
 import hydra
 from hydra import compose, initialize
+from hydra import initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
 
 from utils import get_lightning_module_dataloader
@@ -133,6 +140,26 @@ def main(cfg : DictConfig) -> None:
     if cfg.Env.stdiff_init_ckpt is not None:
         model = STDiffDiffusers.from_pretrained(cfg.Env.stdiff_init_ckpt, subfolder='unet')
         print('Init from a checkpoint')
+    
+    # Enable gradient checkpointing if configured
+    if cfg.Training.gradient_checkpointing:
+        # Enable gradient checkpointing on the UNet blocks
+        def enable_gc_recursive(module):
+            if hasattr(module, 'gradient_checkpointing'):
+                module.gradient_checkpointing = True
+            for child in module.children():
+                enable_gc_recursive(child)
+        
+        enable_gc_recursive(model.diffusion_unet)
+        logger.info("Gradient checkpointing enabled")
+    
+    # Enable xformers memory efficient attention if configured
+    if cfg.Training.use_xformers:
+        try:
+            model.enable_xformers_memory_efficient_attention()
+            logger.info("XFormers memory efficient attention enabled")
+        except Exception as e:
+            logger.warning(f"Failed to enable xformers: {e}. Continuing without xformers.")
 
     # Create EMA for the model.
     if cfg.Training.use_ema:
@@ -170,7 +197,7 @@ def main(cfg : DictConfig) -> None:
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
 
     # Preprocessing the datasets and DataLoaders creation.
-    train_dataloader, val_dataloader, test_dataloader = get_lightning_module_dataloader(cfg)
+    train_dataloader, val_dataloader, test_dataloader, _ = get_lightning_module_dataloader(cfg)
 
     # Initialize the learning rate scheduler
     lr_scheduler = get_scheduler(
@@ -227,13 +254,28 @@ def main(cfg : DictConfig) -> None:
     # Train!
     for epoch in range(first_epoch, cfg.Training.epochs):
         model.train()
-        progress_bar = tqdm(total=num_update_steps_per_epoch, disable=not accelerator.is_local_main_process)
+        # Configure tqdm for immediate output flushing
+        progress_bar = tqdm(total=num_update_steps_per_epoch, disable=not accelerator.is_local_main_process, 
+                           file=sys.stdout, mininterval=0.1)
         progress_bar.set_description(f"Epoch {epoch}")
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
-                Vo, Vp, Vo_last_frame, idx_o, idx_p = batch
+                # Handle both regular datasets and range image datasets (with masks)
+                if len(batch) == 8:  # Range images with masks
+                    Vo, Vp, Vo_last_frame, idx_o, idx_p, Vo_mask, Vp_mask, Vo_last_mask = batch
+                    has_masks = True
+                else:  # Regular datasets without masks
+                    Vo, Vp, Vo_last_frame, idx_o, idx_p = batch
+                    has_masks = False
+                    Vo_mask = None
+                    Vp_mask = None
             
                 clean_images = Vp.flatten(0, 1)
+                # Flatten masks if they exist
+                if has_masks:
+                    valid_mask = Vp_mask.flatten(0, 1)  # (N*Tp, H, W)
+                else:
+                    valid_mask = None
 
                 # Skip steps until we reach the resumed step
                 if cfg.Env.resume_ckpt and epoch == first_epoch and step < resume_step:
@@ -262,18 +304,28 @@ def main(cfg : DictConfig) -> None:
                 model_output = model(Vo, idx_o, idx_p, noisy_images, timesteps, Vp, Vo_last_frame).sample
 
                 if cfg.STDiff.Diffusion.prediction_type == "epsilon":
-                    loss = F.l1_loss(model_output, noise)  # this could have different weights!
+                    loss_per_pixel = F.l1_loss(model_output, noise, reduction="none")  # (N*Tp, C, H, W)
                 elif cfg.STDiff.Diffusion.prediction_type == "sample":
                     alpha_t = _extract_into_tensor(
                         noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
                     )
                     snr_weights = alpha_t / (1 - alpha_t)
-                    loss = snr_weights * F.l1_loss(
+                    loss_per_pixel = snr_weights * F.l1_loss(
                         model_output, clean_images, reduction="none"
                     )  # use SNR weighting from distillation paper
-                    loss = loss.mean()
                 else:
                     raise ValueError(f"Unsupported prediction type: {cfg.STDiff.Diffusion.prediction_type}")
+                
+                # Mask invalid pixels if masks are provided
+                if has_masks and valid_mask is not None:
+                    # Expand mask to match loss shape: (N*Tp, C, H, W)
+                    # valid_mask is (N*Tp, H, W), need to add channel dimension
+                    valid_mask_expanded = valid_mask.unsqueeze(1).expand_as(loss_per_pixel)  # (N*Tp, C, H, W)
+                    # Only compute loss on valid pixels
+                    loss = (loss_per_pixel * valid_mask_expanded.float()).sum() / valid_mask_expanded.float().sum().clamp(min=1.0)
+                else:
+                    # No masks, compute loss on all pixels
+                    loss = loss_per_pixel.mean()
 
                 accelerator.backward(loss)
 
@@ -282,6 +334,10 @@ def main(cfg : DictConfig) -> None:
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
+                
+                # Clear cache periodically to reduce fragmentation
+                if step % 10 == 0:
+                    torch.cuda.empty_cache()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -295,6 +351,23 @@ def main(cfg : DictConfig) -> None:
                         save_path = os.path.join(cfg.Env.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
+                        
+                        # Automatically clean up old checkpoints
+                        max_checkpoints = cfg.Training.get('max_checkpoints_to_keep', 3)
+                        if max_checkpoints > 0:
+                            # Find all checkpoint directories
+                            checkpoint_pattern = os.path.join(cfg.Env.output_dir, "checkpoint-*")
+                            checkpoints = sorted(glob.glob(checkpoint_pattern), key=os.path.getmtime)
+                            
+                            # Keep only the latest N checkpoints
+                            if len(checkpoints) > max_checkpoints:
+                                checkpoints_to_delete = checkpoints[:-max_checkpoints]
+                                for old_checkpoint in checkpoints_to_delete:
+                                    try:
+                                        shutil.rmtree(old_checkpoint)
+                                        logger.info(f"Deleted old checkpoint: {os.path.basename(old_checkpoint)}")
+                                    except Exception as e:
+                                        logger.warning(f"Failed to delete checkpoint {old_checkpoint}: {e}")
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
             if cfg.Training.use_ema:
@@ -321,7 +394,12 @@ def main(cfg : DictConfig) -> None:
 
                 generator = torch.Generator(device=pipeline.device).manual_seed(0)
                 # run pipeline in inference (sample random noise and denoise)
-                Vo, _, Vo_last_frame, idx_o, idx_p = next(iter(train_dataloader))
+                batch = next(iter(train_dataloader))
+                # Handle both regular datasets (5 values) and range images with masks (8 values)
+                if len(batch) == 8:
+                    Vo, _, Vo_last_frame, idx_o, idx_p, _, _, _ = batch
+                else:
+                    Vo, _, Vo_last_frame, idx_o, idx_p = batch
                 images = pipeline(
                     Vo,
                     Vo_last_frame,
@@ -373,8 +451,7 @@ def main(cfg : DictConfig) -> None:
 
 if __name__ == '__main__':
     config_path = Path(parse_args())
-    initialize(version_base=None, config_path=str(config_path.parent))
+    initialize_config_dir(version_base=None, config_dir=str('/home/anirudh/STDiffProject/stdiff/configs'))
     cfg = compose(config_name=str(config_path.name))
 
     main(cfg)
-    main()
