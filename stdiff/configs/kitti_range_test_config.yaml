@@ -4,7 +4,7 @@ Dataset:
     phase: 'deploy'
     dev_set_size: null
     batch_size: 1  # Reduced for range images
-    num_workers: 2
+    num_workers: 3
     num_channels: 1  # Grayscale range images
     image_size: [64, 512]  # Range images: 64 height x 512 width
     num_observed_frames: 3
@@ -14,19 +14,31 @@ Dataset:
     rand_Tp: 3
     rand_predict: True
     half_fps: False
-    test_folder_ids: [9]  # Folder indices for testing
+    test_folder_ids: [06,07,08,09]  # Folder indices for testing
 
 STDiff:
     Diffusion:
         prediction_type: 'epsilon' #'epsilon' or 'sample'
-        ddpm_num_steps: 100
-        ddpm_num_inference_steps: 50
-        ddpm_beta_schedule: 'squaredcos_cap_v2'
+        ddpm_num_steps: 1000
+        ddpm_num_inference_steps: 100
+        ddpm_beta_schedule: 'linear'
 
         unet_config:
             sample_size: [64, 512]  # Non-square: 64 height x 512 width
-            in_channels: 2  # For autoregressive: 1 (current) + 1 (previous frame)
-            out_channels: 1  # Grayscale output
+            # Note: in_channels depends on autoregressive and predict_mask:
+            # - Autoregressive=False, predict_mask=False: in_channels = out_channels + To*C
+            #   Example: 1 (out_channels) + 3*1 (To*C) = 4
+            # - Autoregressive=False, predict_mask=True: in_channels = out_channels + To*C
+            #   Example: 2 (out_channels: 1 image + 1 mask) + 3*1 (To*C) = 5
+            # - Autoregressive=True, predict_mask=False: in_channels = 2 (1 current + 1 previous)
+            # - Autoregressive=True, predict_mask=True: in_channels = 3 (1 current + 1 previous + 1 mask)
+            # For non-autoregressive with To=3, C=1: in_channels = out_channels + To*C
+            # When predict_mask=True: in_channels = out_channels (2) + To*C (3) = 5
+            in_channels: 5  # For non-autoregressive with predict_mask=True: out_channels (2) + To*C (3*1) = 5
+                             # If predict_mask=False: set to 4 (out_channels=1 + To*C=3)
+            # Note: When predict_mask=True, out_channels should be 2 (1 image + 1 mask)
+            # IMPORTANT: You must set out_channels=2 and in_channels=5 in config when predict_mask=True
+            out_channels: 2  # Grayscale output (set to 2 if predict_mask=True)
             m_channels: 256
             layers_per_block: 2
             #config for resolution 64x512
@@ -36,7 +48,7 @@ STDiff:
             attention_head_dim: [null, 32, 64, 192, 256]
 
     DiffNet:
-        autoregressive: True
+        autoregressive: False
         super_res_training: False
         MotionEncoder:
             learn_diff_image: True
@@ -63,13 +75,13 @@ STDiff:
 
 TestCfg:
     # Load from checkpoint-6 in the output directory
-    ckpt_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512/checkpoint-70400"
-    test_results_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512/test_results_checkpoint-70400_50steps"
+    ckpt_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask/checkpoint-2400"
+    test_results_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask/test_results_checkpoint-2400_DDPM_100steps"
     gradient_checkpointing: False  # Enable to save memory during inference
     use_xformers: False  # Enable xformers memory efficient attention (requires xformers package)
     scheduler: 
-        name: 'DPMMS' #'DPMMS' or 'DDPM'
-        sample_steps: 50  # Match ddpm_num_inference_steps
+        name: 'DDPM' #'DPMMS' or 'DDPM'
+        sample_steps: 100  # Match ddpm_num_inference_steps
 
     fps: 1
     metrics: ['PSNR', 'SSIM', 'LPIPS', 'InterLPIPS']
@@ -78,4 +90,7 @@ TestCfg:
         first_pred_parralle_bs: 3
         sample_num: 3
         fix_init_noise: False
+    
+    # Mask prediction settings
+    predict_mask: True  # Enable mask prediction (requires masks in dataset)
 

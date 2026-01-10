@@ -177,26 +177,79 @@ def main(cfg : DictConfig) -> None:
                     Vp_mask = None
                     Vo_last_mask = None
 
+                # Check if mask prediction is enabled (from config)
+                predict_mask = cfg.TestCfg.get('predict_mask', False) and has_masks
+                
                 preds = []
+                preds_mask = [] if predict_mask else None
                 if cfg.TestCfg.random_predict.first_pred_sample_num >= 2:
-                    filter_first_out = stdiff_pipeline.filter_best_first_pred(cfg.TestCfg.random_predict.first_pred_sample_num, Vo.clone(), 
-                                                                            Vo_last_frame, Vp[:, 0:1, ...], idx_o, idx_p, 
-                                                                            num_inference_steps = cfg.TestCfg.scheduler.sample_steps,
-                                                                            fix_init_noise=cfg.TestCfg.random_predict.fix_init_noise,
-                                                                            bs = cfg.TestCfg.random_predict.first_pred_parralle_bs)
+                    if predict_mask:
+                        filter_first_out = stdiff_pipeline.filter_best_first_pred(
+                            cfg.TestCfg.random_predict.first_pred_sample_num, Vo.clone(), 
+                            Vo_last_frame, Vp[:, 0:1, ...], idx_o, idx_p, 
+                            num_inference_steps = cfg.TestCfg.scheduler.sample_steps,
+                            fix_init_noise=cfg.TestCfg.random_predict.fix_init_noise,
+                            bs = cfg.TestCfg.random_predict.first_pred_parralle_bs,
+                            predict_mask=True,
+                            Vp_first_mask=Vp_mask[:, 0:1, ...] if has_masks else None
+                        )
+                    else:
+                        filter_first_out = stdiff_pipeline.filter_best_first_pred(
+                            cfg.TestCfg.random_predict.first_pred_sample_num, Vo.clone(), 
+                            Vo_last_frame, Vp[:, 0:1, ...], idx_o, idx_p, 
+                            num_inference_steps = cfg.TestCfg.scheduler.sample_steps,
+                            fix_init_noise=cfg.TestCfg.random_predict.fix_init_noise,
+                            bs = cfg.TestCfg.random_predict.first_pred_parralle_bs
+                        )
                 
                 for i in range(cfg.TestCfg.random_predict.sample_num):
                     pred_clip = []
+                    pred_clip_mask = [] if predict_mask else None
                     Vo_input = Vo.clone()
                     # Reset Vo_last_frame for each new trajectory (sample)
                     Vo_last_frame_iter = Vo_last_frame.clone()
                     for j in range(autoreg_iter):
                         if j == 0 and cfg.TestCfg.random_predict.first_pred_sample_num >= 2:
-                            temp_pred = stdiff_pipeline.pred_remainig_frames(*(filter_first_out + (cfg.TestCfg.random_predict.fix_init_noise,"pil", False)))
+                            if predict_mask:
+                                # filter_first_out has 6 values when predict_mask=True: 
+                                # (best_m_first, best_first_preds, best_first_masks, idx_p, image_shape, generator)
+                                best_m_first, best_first_preds, best_first_masks, idx_p, image_shape, gen = filter_first_out
+                                temp_pred, temp_mask = stdiff_pipeline.pred_remainig_frames(
+                                    best_m_first, best_first_preds, idx_p, image_shape, gen,
+                                    fix_init_noise=cfg.TestCfg.random_predict.fix_init_noise,
+                                    output_type="pil", to_cpu=False, 
+                                    num_inference_steps=cfg.TestCfg.scheduler.sample_steps,
+                                    predict_mask=True, best_first_masks=best_first_masks,
+                                    Vo=Vo_input, idx_o=idx_o)
+                            else:
+                                # filter_first_out has 5 values when predict_mask=False:
+                                # (best_m_first, best_first_preds, idx_p, image_shape, generator)
+                                best_m_first, best_first_preds, idx_p, image_shape, gen = filter_first_out
+                                temp_pred = stdiff_pipeline.pred_remainig_frames(
+                                    best_m_first, best_first_preds, idx_p, image_shape, gen,
+                                    fix_init_noise=cfg.TestCfg.random_predict.fix_init_noise,
+                                    output_type="pil", to_cpu=False, 
+                                    num_inference_steps=cfg.TestCfg.scheduler.sample_steps,
+                                    Vo=Vo_input, idx_o=idx_o)
                         else:
-                            temp_pred = stdiff_pipeline(Vo_input, Vo_last_frame_iter, idx_o, idx_p, num_inference_steps = cfg.TestCfg.scheduler.sample_steps,
-                                                    to_cpu=False, fix_init_noise=cfg.TestCfg.random_predict.fix_init_noise) #Torch Tensor (N, Tp, C, H, W), range [0, 1]
+                            if predict_mask:
+                                temp_pred, temp_mask = stdiff_pipeline(
+                                    Vo_input, Vo_last_frame_iter, idx_o, idx_p, 
+                                    num_inference_steps = cfg.TestCfg.scheduler.sample_steps,
+                                    to_cpu=False, fix_init_noise=cfg.TestCfg.random_predict.fix_init_noise,
+                                    predict_mask=True, Vp_mask=Vp_mask
+                                ) # Returns tuple: (image, mask)
+                            else:
+                                temp_pred = stdiff_pipeline(
+                                    Vo_input, Vo_last_frame_iter, idx_o, idx_p, 
+                                    num_inference_steps = cfg.TestCfg.scheduler.sample_steps,
+                                    to_cpu=False, fix_init_noise=cfg.TestCfg.random_predict.fix_init_noise
+                                ) #Torch Tensor (N, Tp, C, H, W), range [0, 1]
+                        
                         pred_clip.append(temp_pred)
+                        if predict_mask:
+                            pred_clip_mask.append(temp_mask)
+                        
                         # Convert from [0, 1] to [-1, 1] for next autoregressive iteration
                         temp_pred_clamped = temp_pred.clamp(0, 1)
                         Vo_input = temp_pred_clamped[:, -To:, ...]*2. - 1.
@@ -209,10 +262,20 @@ def main(cfg : DictConfig) -> None:
                     if autoreg_rem > 0:
                         pred_clip = pred_clip[:, 0:(autoreg_rem - cfg.Dataset.num_predict_frames), ...]
                     preds.append(pred_clip)
+                    if predict_mask:
+                        pred_clip_mask = torch.cat(pred_clip_mask, dim = 1)
+                        if autoreg_rem > 0:
+                            pred_clip_mask = pred_clip_mask[:, 0:(autoreg_rem - cfg.Dataset.num_predict_frames), ...]
+                        preds_mask.append(pred_clip_mask)
                     
                 preds = torch.stack(preds, 0) #(sample_num, N, Tp, C, H, W)
                 preds = preds.permute(1, 0, 2, 3, 4, 5).contiguous() #(N, sample_num, num_predict_frames, C, H, W)
                 preds = preds.clamp(0, 1)
+                
+                if predict_mask:
+                    preds_mask = torch.stack(preds_mask, 0) #(sample_num, N, Tp, 1, H, W)
+                    preds_mask = preds_mask.permute(1, 0, 2, 3, 4, 5).contiguous() #(N, sample_num, num_predict_frames, 1, H, W)
+                    # preds_mask are raw values in [-1, 1], keep as is (no clamping)
                 
                 # Denormalize Vo and Vp for visualization
                 Vo_vis = (Vo / 2 + 0.5).clamp(0, 1)
@@ -225,14 +288,26 @@ def main(cfg : DictConfig) -> None:
                 # Gather masks if available (for KITTI_RANGE)
                 if has_masks:
                     g_Vp_mask = accelerator.gather(Vp_mask)
+                    # Vo_mask is from the original batch, need to gather it
+                    g_Vo_mask = accelerator.gather(Vo_mask) if Vo_mask is not None else None
                 else:
                     g_Vp_mask = None
+                    g_Vo_mask = None
+                
+                # Gather predicted masks if predict_mask is enabled
+                if predict_mask:
+                    g_preds_mask = accelerator.gather(preds_mask)
+                else:
+                    g_preds_mask = None
 
                 if accelerator.is_main_process:
                     dump_obj = {'Vo': g_Vo.detach().cpu(), 'g_Vp': g_Vp.detach().cpu(), 'g_Preds': g_preds.detach().cpu()}
                     # Add mask for ground truth predictions (Vp_mask) if available
                     if g_Vp_mask is not None:
                         dump_obj['g_Vp_mask'] = g_Vp_mask.detach().cpu()
+                    # Add predicted masks if available
+                    if g_preds_mask is not None:
+                        dump_obj['g_Preds_mask'] = g_preds_mask.detach().cpu()
                     # Add global min/max for KITTI_RANGE (for evaluation)
                     if cfg.Dataset.name == 'KITTI_RANGE' and global_min is not None and global_max is not None:
                         dump_obj['global_min'] = global_min
@@ -240,7 +315,34 @@ def main(cfg : DictConfig) -> None:
                     torch.save(dump_obj, f=Path(r_save_path).joinpath(f'Preds_{idx}.pt'))
                     progress_bar.update(1)
                     for i  in range(min(cfg.TestCfg.random_predict.sample_num, 4)):
-                        visualize_batch_clips(Vo_vis, Vp_vis, preds[:, i, ...], file_dir=Path(r_save_path).joinpath(f'test_examples_{idx}_traj{i}'))
+                        # Prepare masks for visualization if available
+                        pred_masks_vis = None
+                        gt_future_masks_vis = None
+                        gt_past_masks_vis = None
+                        
+                        if predict_mask and g_preds_mask is not None:
+                            # preds_mask: (N, sample_num, Tp, 1, H, W) - raw values in [-1, 1]
+                            pred_masks_vis = g_preds_mask[:, i, ...]  # (N, Tp, 1, H, W)
+                            # Normalize to [0, 1] for visualization (will be converted to binary in visualize function)
+                            pred_masks_vis = (pred_masks_vis + 1.0) / 2.0
+                        
+                        if has_masks and g_Vp_mask is not None:
+                            # Vp_mask: (N, Tp, H, W) - binary [0, 1]
+                            # Add channel dimension for visualization
+                            gt_future_masks_vis = g_Vp_mask.unsqueeze(2)  # (N, Tp, 1, H, W)
+                        
+                        if has_masks and g_Vo_mask is not None:
+                            # Vo_mask: (N, To, H, W) - binary [0, 1]
+                            # Add channel dimension
+                            gt_past_masks_vis = g_Vo_mask.unsqueeze(2)  # (N, To, 1, H, W)
+                        
+                        visualize_batch_clips(
+                            Vo_vis, Vp_vis, preds[:, i, ...], 
+                            file_dir=Path(r_save_path).joinpath(f'test_examples_{idx}_traj{i}'),
+                            pred_masks_batch=pred_masks_vis,
+                            gt_future_masks_batch=gt_future_masks_vis,
+                            gt_past_masks_batch=gt_past_masks_vis
+                        )
 
                     del g_Vo
                     del g_Vp

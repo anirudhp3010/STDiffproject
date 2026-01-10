@@ -20,7 +20,8 @@ class STDiffDiffusers(ModelMixin, ConfigMixin):
             self.tde_model = DiffModel(tde_cfg.Int, tde_cfg.MotionEncoder, tde_cfg.DiffUnet)
         self.diffusion_unet = UNet2DMotionCond(**unet_cfg)
 
-    def forward(self, Vo, idx_o, idx_p, noisy_Vp, timestep, clean_Vp = None, Vo_last_frame=None):
+    def forward(self, Vo, idx_o, idx_p, noisy_Vp, timestep, clean_Vp = None, Vo_last_frame=None, 
+                noisy_mask=None, clean_mask=None, predict_mask=False):
         #vo: (N, To, C, Ho, Wo), idx_o: (To, ), idx_p: (Tp, ), noisy_Vp: (N*Tp, C, Hp, Wp)
         m_context = self.tde_model.context_encode(Vo, idx_o) #(N, C, H, W)
             
@@ -44,6 +45,35 @@ class STDiffDiffusers(ModelMixin, ConfigMixin):
             prev_frames = torch.cat([Vo_last_frame, clean_Vp[:, 0:-1, ...]], dim = 1)
             noisy_Vp = torch.cat([noisy_Vp, prev_frames.flatten(0, 1)], dim = 1)
 
+        # Handle mask prediction: concatenate mask with image if predict_mask is True
+        # Note: In non-autoregressive mode, the mask may already be concatenated in noisy_Vp
+        # (done in training code). Check if mask needs to be added by checking channel count.
+        if predict_mask and noisy_mask is not None:
+            # For autoregressive mode, we need to add the mask
+            # For non-autoregressive mode, check if mask is already in noisy_Vp
+            if self.autoreg:
+                # Autoregressive: concatenate mask
+                noisy_Vp = torch.cat([noisy_Vp, noisy_mask], dim=1)
+            else:
+                # Non-autoregressive: mask should already be in noisy_Vp from training code
+                # But if it's not (e.g., during inference), add it
+                # Check expected channels: out_channels (2) + To*C
+                # If noisy_Vp has fewer channels than expected, add mask
+                expected_channels_with_mask = 2 + Vo.shape[1] * Vo.shape[2]  # out_channels + To*C
+                if noisy_Vp.shape[1] < expected_channels_with_mask:
+                    noisy_Vp = torch.cat([noisy_Vp, noisy_mask], dim=1)
+
         out = self.diffusion_unet(noisy_Vp, timestep, m_feat = m_future.permute(1, 0, 2, 3, 4).flatten(0, 1))
+        
+        # Split output if predict_mask: out_channels should be 2 (1 image + 1 mask)
+        if predict_mask:
+            # Split output: channels 0 for image, channel 1 for mask
+            image_output = out.sample[:, 0:1, ...]  # (N*Tp, 1, H, W) for grayscale
+            mask_output = out.sample[:, 1:2, ...]   # (N*Tp, 1, H, W)
+            # Store both in the output object for backward compatibility
+            out.image_sample = image_output
+            out.mask_sample = mask_output
+            # Set sample to image for backward compatibility with existing code
+            out.sample = image_output
         
         return out

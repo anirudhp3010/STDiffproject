@@ -55,7 +55,9 @@ class STDiffPipeline(DiffusionPipeline):
         num_inference_steps: int = 1000,
         output_type: Optional[str] = "pil",
         to_cpu=True,
-        fix_init_noise=None
+        fix_init_noise=None,
+        predict_mask: bool = False,
+        Vp_mask: Optional[torch.Tensor] = None
     ) -> Union[ImagePipelineOutput, Tuple]:
         r"""
         Args:
@@ -84,6 +86,19 @@ class STDiffPipeline(DiffusionPipeline):
             else:
                 fix_init_noise = False
 
+        # Handle mask prediction
+        if predict_mask:
+            if Vp_mask is None:
+                raise ValueError("Vp_mask must be provided when predict_mask=True")
+            # Vp_mask should be (N, Tp, H, W) for non-autoregressive or (N, 1, H, W) for autoregressive
+            # Normalize masks to [-1, 1] for diffusion (masks are binary [0, 1])
+            if not self.stdiff.autoreg:
+                # For non-autoregressive: Vp_mask is (N, Tp, H, W)
+                mask_shape = (Vp_mask.shape[0] * idx_p.shape[0], 1, Vp_mask.shape[2], Vp_mask.shape[3])
+            else:
+                # For autoregressive: Vp_mask is (N, 1, H, W) per frame
+                mask_shape = (Vp_mask.shape[0], 1, Vp_mask.shape[2], Vp_mask.shape[3])
+
         if not self.stdiff.autoreg:
             # Sample gaussian noise to begin loop
             # Handle both square (int) and non-square (list/tuple/ListConfig) sample_size
@@ -91,15 +106,35 @@ class STDiffPipeline(DiffusionPipeline):
                 sample_h, sample_w = int(self.stdiff.diffusion_unet.sample_size[0]), int(self.stdiff.diffusion_unet.sample_size[1])
             else:
                 sample_h = sample_w = self.stdiff.diffusion_unet.sample_size
+            
+            # Reshape Vo (all observed frames) to concatenate along channel dimension
+            # Vo: (N, To, C, H, W) -> Vo_reshaped: (N, To*C, H, W)
+            # This concatenates all observed frames along the channel dimension
+            # Direct view: flattens To and C dimensions together
+            Vo_reshaped = Vo.view(Vo.shape[0], Vo.shape[1] * Vo.shape[2], Vo.shape[3], Vo.shape[4])  # (N, To*C, H, W)
+            
+            # Note: in_channels should account for concatenation (image + all Vo frames)
+            # We'll use out_channels for the noise image shape since we'll concatenate
+            # If predict_mask, out_channels should be 2 (1 image + 1 mask), else 1
+            out_channels = 2 if predict_mask else 1
             if fix_init_noise:
-                image_shape = (Vo.shape[0], self.stdiff.diffusion_unet.in_channels, sample_h, sample_w)
+                # For noise: use out_channels (will be concatenated with Vo later)
+                image_shape = (Vo.shape[0], out_channels, sample_h, sample_w)
             else:
                 batch_size = Vo.shape[0]*idx_p.shape[0]
-                image_shape = (batch_size, self.stdiff.diffusion_unet.in_channels, sample_h, sample_w)
+                image_shape = (batch_size, out_channels, sample_h, sample_w)
                 
             image = self.init_noise(image_shape, generator)
             if fix_init_noise:
                 image = image.unsqueeze(1).repeat(1, idx_p.shape[0], 1, 1, 1).flatten(0, 1)
+            # Now image shape: (N*Tp, out_channels, H, W)
+            # If predict_mask, image already contains both image and mask channels (out_channels=2)
+            
+            # Repeat Vo_reshaped for all Tp frames to match batch dimension
+            # Vo_reshaped: (N, To*C, H, W) -> (N*Tp, To*C, H, W)
+            Vo_expanded = Vo_reshaped.unsqueeze(1).repeat(1, idx_p.shape[0], 1, 1, 1).flatten(0, 1)
+            # Vo_expanded: (N*Tp, To*C, H, W)
+            
             # set step values
             self.scheduler.set_timesteps(num_inference_steps)
 
@@ -111,12 +146,25 @@ class STDiffPipeline(DiffusionPipeline):
             m_future = self.stdiff.tde_model.future_predict(m_context, torch.cat([idx_o[-1:], idx_p])) #(Tp, N, C, H, W)
 
             for t in self.progress_bar(self.scheduler.timesteps):
+                # Concatenate noisy image with all observed frames (Vo) along channel dimension
+                # image: (N*Tp, out_channels, H, W), Vo_expanded: (N*Tp, To*C, H, W)
+                # Concatenated: (N*Tp, out_channels + To*C, H, W) = (N*Tp, in_channels, H, W)
+                unet_input = torch.cat([image, Vo_expanded.clamp(-1, 1)], dim=1)
+                
                 # 1. predict noise model_output
-                model_output = self.stdiff.diffusion_unet(image, t, m_feat = m_future.permute(1, 0, 2, 3, 4).flatten(0, 1)).sample
+                model_output = self.stdiff.diffusion_unet(unet_input, t, m_feat = m_future.permute(1, 0, 2, 3, 4).flatten(0, 1)).sample
 
                 # 2. compute previous image: x_t -> x_t-1
                 #image = self.scheduler.step(model_output, t, image, generator=generator).prev_sample
                 image = self.scheduler.step(model_output, t, image).prev_sample
+            
+            # Split image and mask if predict_mask (for non-autoregressive mode)
+            if predict_mask:
+                pred_image = image[:, 0:1, ...]
+                pred_mask = image[:, 1:2, ...]  # Raw mask values (no sigmoid applied)
+            else:
+                pred_image = image
+                pred_mask = None
         
         else:
             # Sample gaussian noise to begin loop
@@ -125,7 +173,8 @@ class STDiffPipeline(DiffusionPipeline):
                 sample_h, sample_w = int(self.stdiff.diffusion_unet.sample_size[0]), int(self.stdiff.diffusion_unet.sample_size[1])
             else:
                 sample_h = sample_w = self.stdiff.diffusion_unet.sample_size
-            image_shape = (Vo.shape[0], self.stdiff.diffusion_unet.out_channels, sample_h, sample_w)
+            out_channels = 2 if predict_mask else 1
+            image_shape = (Vo.shape[0], out_channels, sample_h, sample_w)
             
             # set step values
             self.scheduler.set_timesteps(num_inference_steps)
@@ -148,7 +197,12 @@ class STDiffPipeline(DiffusionPipeline):
             
             image = self.init_noise(image_shape, generator)
             imgs = []
+            masks = [] if predict_mask else None
             for tp in range(idx_p.shape[0]):
+                # Reset scheduler state for each frame's denoising loop
+                # This is critical for DPMSolverMultistepScheduler which maintains internal state
+                self.scheduler.set_timesteps(num_inference_steps)
+                
                 if tp == 0:
                     if self.stdiff.super_res_training:
                         Vo_last_frame = up_sample(Vo[:, -1, ...])
@@ -162,29 +216,96 @@ class STDiffPipeline(DiffusionPipeline):
                         prev_frame = imgs[-1]
                 
                 if not fix_init_noise:
+                    # Initialize noise - if predict_mask, image_shape already has out_channels=2
                     image = self.init_noise(image_shape, generator)
+                    # image already contains both channels if predict_mask (out_channels=2)
                 
                 for t in self.progress_bar(self.scheduler.timesteps):
                     # 1. predict noise model_output
-                    model_output = self.stdiff.diffusion_unet(torch.cat([image, prev_frame.clamp(-1, 1)], dim = 1), t, m_feat = m_future[tp, ...]).sample
+                    # Concatenate image (which may contain mask) with prev_frame
+                    unet_input = torch.cat([image, prev_frame.clamp(-1, 1)], dim = 1)
+                    model_output = self.stdiff.diffusion_unet(unet_input, t, m_feat = m_future[tp, ...]).sample
 
                     # 2. compute previous image: x_t -> x_t-1
                     #image = self.scheduler.step(model_output, t, image, generator=generator).prev_sample
                     image = self.scheduler.step(model_output, t, image).prev_sample
 
-                imgs.append(image)
+                # Split image and mask if predict_mask
+                if predict_mask:
+                    pred_image = image[:, 0:1, ...]
+                    pred_mask = image[:, 1:2, ...]  # Raw mask values (no sigmoid applied)
+                    imgs.append(pred_image)
+                    masks.append(pred_mask)
+                else:
+                    imgs.append(image)
 
-            image = torch.stack(imgs, dim = 1).flatten(0, 1)
+            if predict_mask:
+                image = torch.stack(imgs, dim = 1).flatten(0, 1)
+                mask = torch.stack(masks, dim = 1).flatten(0, 1)  # Raw mask values
+            else:
+                image = torch.stack(imgs, dim = 1).flatten(0, 1)
             
-        image = (image / 2 + 0.5).clamp(0, 1)
-        if output_type == "numpy":
-            image = image.cpu().permute(0, 2, 3, 1).numpy()
-            return ImagePipelineOutput(images=image)
+        # Normalize image to [0, 1]
+        if not self.stdiff.autoreg:
+            # For non-autoregressive, image is already split
+            if predict_mask:
+                pred_image = (pred_image / 2 + 0.5).clamp(0, 1)
+                # Mask is in [-1, 1] range from denoising, keep as raw values (no sigmoid, no thresholding)
+                # Caller can apply: mask = torch.sigmoid(pred_mask) then threshold if needed
+                pred_mask = pred_mask  # Keep raw values
+            else:
+                pred_image = (pred_image / 2 + 0.5).clamp(0, 1)
         else:
-            image = rearrange(image, '(N T) C H W -> N T C H W', N = Vo.shape[0], T = idx_p.shape[0])
-            if to_cpu:
-                image = image.cpu()
-            return image
+            # For autoregressive, image and mask are already split
+            if predict_mask:
+                image = (image / 2 + 0.5).clamp(0, 1)
+                # Mask is in [-1, 1] range from denoising, keep as raw values
+                mask = mask  # Keep raw values
+            else:
+                image = (image / 2 + 0.5).clamp(0, 1)
+            
+        if output_type == "numpy":
+            if not self.stdiff.autoreg:
+                if predict_mask:
+                    pred_image = pred_image.cpu().permute(0, 2, 3, 1).numpy()
+                    pred_mask = pred_mask.cpu().permute(0, 2, 3, 1).numpy()
+                    return ImagePipelineOutput(images=pred_image), pred_mask
+                else:
+                    pred_image = pred_image.cpu().permute(0, 2, 3, 1).numpy()
+                    return ImagePipelineOutput(images=pred_image)
+            else:
+                if predict_mask:
+                    image = image.cpu().permute(0, 2, 3, 1).numpy()
+                    mask = mask.cpu().permute(0, 2, 3, 1).numpy()
+                    return ImagePipelineOutput(images=image), mask
+                else:
+                    image = image.cpu().permute(0, 2, 3, 1).numpy()
+                    return ImagePipelineOutput(images=image)
+        else:
+            if not self.stdiff.autoreg:
+                if predict_mask:
+                    pred_image = rearrange(pred_image, '(N T) C H W -> N T C H W', N = Vo.shape[0], T = idx_p.shape[0])
+                    pred_mask = rearrange(pred_mask, '(N T) C H W -> N T C H W', N = Vo.shape[0], T = idx_p.shape[0])
+                    if to_cpu:
+                        pred_image = pred_image.cpu()
+                        pred_mask = pred_mask.cpu()
+                    return pred_image, pred_mask  # Return tuple: (image, mask) where mask is raw values
+                else:
+                    pred_image = rearrange(pred_image, '(N T) C H W -> N T C H W', N = Vo.shape[0], T = idx_p.shape[0])
+                    if to_cpu:
+                        pred_image = pred_image.cpu()
+                    return pred_image
+            else:
+                image = rearrange(image, '(N T) C H W -> N T C H W', N = Vo.shape[0], T = idx_p.shape[0])
+                if to_cpu:
+                    image = image.cpu()
+                if predict_mask:
+                    mask = rearrange(mask, '(N T) C H W -> N T C H W', N = Vo.shape[0], T = idx_p.shape[0])
+                    if to_cpu:
+                        mask = mask.cpu()
+                    return image, mask  # Return tuple: (image, mask) where mask is raw values
+                else:
+                    return image
     
     def init_noise(self, image_shape, generator):
         if self.device.type == "mps":
@@ -203,14 +324,17 @@ class STDiffPipeline(DiffusionPipeline):
                                generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
                                num_inference_steps: int = 1000,
                                fix_init_noise=False,
-                               bs = 4):
+                               bs = 4,
+                               predict_mask: bool = False,
+                               Vp_first_mask: Optional[torch.Tensor] = None):
         # Sample gaussian noise to begin loop
         # Handle both square (int) and non-square (list/tuple) sample_size
         if isinstance(self.stdiff.diffusion_unet.sample_size, (list, tuple)):
             sample_h, sample_w = self.stdiff.diffusion_unet.sample_size[0], self.stdiff.diffusion_unet.sample_size[1]
         else:
             sample_h = sample_w = self.stdiff.diffusion_unet.sample_size
-        image_shape = (Vo.shape[0], self.stdiff.diffusion_unet.out_channels, sample_h, sample_w)
+        out_channels = 2 if predict_mask else 1
+        image_shape = (Vo.shape[0], out_channels, sample_h, sample_w)
         
         # set step values
         self.scheduler.set_timesteps(num_inference_steps)
@@ -220,7 +344,16 @@ class STDiffPipeline(DiffusionPipeline):
         m_context = self.stdiff.tde_model.context_encode(Vo, idx_o) #(N, C, H, W)
 
         assert Vp_first_frame is not None, "Please input ground truth first future frame"
-        prev_frame = Vo_last_frame[:, -1, ...]
+        
+        # Handle non-autoregressive mode: need to use all Vo frames, not just the last one
+        if not self.stdiff.autoreg:
+            # Reshape Vo (all observed frames) to concatenate along channel dimension
+            # Vo: (N, To, C, H, W) -> Vo_reshaped: (N, To*C, H, W)
+            Vo_reshaped = Vo.view(Vo.shape[0], Vo.shape[1] * Vo.shape[2], Vo.shape[3], Vo.shape[4])  # (N, To*C, H, W)
+        else:
+            # Autoregressive mode: use only the last frame
+            prev_frame = Vo_last_frame[:, -1, ...]
+        
         m_first_all = []
         for i in range(first_pred_sample_num):
             m_first = self.stdiff.tde_model.future_predict(m_context, torch.cat([idx_o[-1:], idx_p[0:1]]))[0, ...] #(N, C, H, W)
@@ -228,21 +361,45 @@ class STDiffPipeline(DiffusionPipeline):
         
         num_iter = first_pred_sample_num//bs + (first_pred_sample_num%bs != 0)
         first_preds = []
+        first_masks = [] if predict_mask else None
         for i in range(num_iter):
+            # Reset scheduler state for each batch's denoising loop
+            # This is critical when batch sizes differ between iterations
+            self.scheduler.set_timesteps(num_inference_steps)
+            
             m_first = torch.stack(m_first_all[i*bs:(i+1)*bs], dim = 1)
             rn = m_first.shape[1]
             image = self.init_noise(image_shape, generator)
             image = image.repeat(rn, 1, 1, 1)
             for t in self.progress_bar(self.scheduler.timesteps):
                 # 1. predict noise model_output
-                model_output = self.stdiff.diffusion_unet(torch.cat([image, prev_frame.repeat(rn, 1, 1, 1).clamp(-1, 1)], dim = 1), t, m_feat = m_first.flatten(0, 1)).sample
+                if not self.stdiff.autoreg:
+                    # Non-autoregressive: concatenate with all Vo frames
+                    # Vo_reshaped: (N, To*C, H, W) -> repeat to (N*rn, To*C, H, W)
+                    # image is (N*rn, out_channels, H, W) after repeat, so we need to match that
+                    Vo_expanded = Vo_reshaped.unsqueeze(1).repeat(1, rn, 1, 1, 1).flatten(0, 1)  # (N*rn, To*C, H, W)
+                    unet_input = torch.cat([image, Vo_expanded.clamp(-1, 1)], dim=1)
+                else:
+                    # Autoregressive: concatenate with last frame only
+                    unet_input = torch.cat([image, prev_frame.repeat(rn, 1, 1, 1).clamp(-1, 1)], dim = 1)
+                model_output = self.stdiff.diffusion_unet(unet_input, t, m_feat = m_first.flatten(0, 1)).sample
 
                 # 2. compute previous image: x_t -> x_t-1
                 #image = self.scheduler.step(model_output, t, image, generator=generator).prev_sample
                 image = self.scheduler.step(model_output, t, image).prev_sample
-            first_preds.append(image)
+            
+            # Split image and mask if predict_mask
+            if predict_mask:
+                pred_image = image[:, 0:1, ...]
+                pred_mask = image[:, 1:2, ...]  # Raw mask values (no sigmoid applied)
+                first_preds.append(pred_image)
+                first_masks.append(pred_mask)
+            else:
+                first_preds.append(image)
             #first_preds.append(rearrange(image, '(N r) C H W -> N r C H W', N=m_first.shape[0], r=rn))
         first_preds = torch.cat(first_preds, dim = 0)
+        if predict_mask:
+            first_masks = torch.cat(first_masks, dim = 0)  # Raw mask values
         
         # Normalize both to [0, 1] for fair SSIM/PSNR comparison
         first_preds_norm = (first_preds / 2 + 0.5).clamp(0, 1)
@@ -263,15 +420,21 @@ class STDiffPipeline(DiffusionPipeline):
             return flatten_best_idx
         flatten_best_idx = FlattenBestIdx(best_idx)
         best_first_preds = first_preds[flatten_best_idx, ...]
+        if predict_mask:
+            best_first_masks = first_masks[flatten_best_idx, ...]  # Raw mask values
 
         m_first_all = torch.cat(m_first_all, dim = 0)
         best_m_first = m_first_all[flatten_best_idx]
-        return best_m_first, best_first_preds, idx_p, image_shape, generator
+        if predict_mask:
+            return best_m_first, best_first_preds, best_first_masks, idx_p, image_shape, generator
+        else:
+            return best_m_first, best_first_preds, idx_p, image_shape, generator
     
     def pred_remainig_frames(self, best_m_first, best_first_preds, idx_p, image_shape, generator, fix_init_noise=False,
-                             output_type: Optional[str] = "pil", to_cpu=True):
+                             output_type: Optional[str] = "pil", to_cpu=True, num_inference_steps: int = 50,
+                             predict_mask: bool = False, best_first_masks: Optional[torch.Tensor] = None,
+                             Vo: Optional[torch.Tensor] = None, idx_o: Optional[torch.Tensor] = None):
         m_future = self.stdiff.tde_model.future_predict(best_m_first, idx_p) #(Tp-1, N, C, H, W)
-        image = self.init_noise(image_shape, generator)
         
         # Ensure best_first_preds is in [-1, 1] range (from scheduler.step().prev_sample)
         # Check if it's accidentally in [0, 1] range and convert back to [-1, 1] to avoid double denormalization
@@ -281,36 +444,87 @@ class STDiffPipeline(DiffusionPipeline):
             print(f"[WARNING] best_first_preds appears to be in [0, 1] range [{best_first_min:.4f}, {best_first_max:.4f}], converting to [-1, 1]")
             best_first_preds = best_first_preds * 2.0 - 1.0
         
+        # Handle non-autoregressive mode: need to use all Vo frames, not just the previous frame
+        if not self.stdiff.autoreg:
+            if Vo is None or idx_o is None:
+                raise ValueError("Vo and idx_o must be provided when autoregressive=False")
+            # Reshape Vo (all observed frames) to concatenate along channel dimension
+            # Vo: (N, To, C, H, W) -> Vo_reshaped: (N, To*C, H, W)
+            Vo_reshaped = Vo.view(Vo.shape[0], Vo.shape[1] * Vo.shape[2], Vo.shape[3], Vo.shape[4])  # (N, To*C, H, W)
+        
         imgs = [best_first_preds]
+        if predict_mask:
+            if best_first_masks is None:
+                raise ValueError("best_first_masks must be provided when predict_mask=True")
+            masks = [best_first_masks]
+        else:
+            masks = None
+        # Initialize noise once if fix_init_noise is True, otherwise will initialize per frame
+        out_channels = 2 if predict_mask else 1
+        if fix_init_noise:
+            image = self.init_noise(image_shape, generator)
+        
         for tp in range(1, idx_p.shape[0]):
+            # Reset scheduler state for each frame's denoising loop
+            # This is critical for DPMSolverMultistepScheduler which maintains internal state
+            self.scheduler.set_timesteps(num_inference_steps)
+            
             if tp == 1:
                 prev_frame = best_first_preds
             else:
                 prev_frame = imgs[-1]
             
+            # Initialize fresh noise for each frame if fix_init_noise is False
             if not fix_init_noise:
                 image = self.init_noise(image_shape, generator)
             
             for t in self.progress_bar(self.scheduler.timesteps):
                 # 1. predict noise model_output
-                model_output = self.stdiff.diffusion_unet(torch.cat([image, prev_frame.clamp(-1, 1)], dim = 1), t, m_feat = m_future[tp-1, ...]).sample
+                if not self.stdiff.autoreg:
+                    # Non-autoregressive: concatenate with all Vo frames
+                    # image: (N, out_channels, H, W), Vo_reshaped: (N, To*C, H, W)
+                    unet_input = torch.cat([image, Vo_reshaped.clamp(-1, 1)], dim=1)
+                else:
+                    # Autoregressive: concatenate with previous frame only
+                    unet_input = torch.cat([image, prev_frame.clamp(-1, 1)], dim = 1)
+                model_output = self.stdiff.diffusion_unet(unet_input, t, m_feat = m_future[tp-1, ...]).sample
 
                 # 2. compute previous image: x_t -> x_t-1
                 #image = self.scheduler.step(model_output, t, image, generator=generator).prev_sample
                 image = self.scheduler.step(model_output, t, image).prev_sample
 
-            imgs.append(image)
+            # Split image and mask if predict_mask
+            if predict_mask:
+                pred_image = image[:, 0:1, ...]
+                pred_mask = image[:, 1:2, ...]  # Raw mask values (no sigmoid applied)
+                imgs.append(pred_image)
+                masks.append(pred_mask)
+            else:
+                imgs.append(image)
 
         image = torch.stack(imgs, dim = 1).flatten(0, 1)
         image = (image / 2 + 0.5).clamp(0, 1)
+        if predict_mask:
+            mask = torch.stack(masks, dim = 1).flatten(0, 1)  # Raw mask values
+        
         if output_type == "numpy":
             image = image.cpu().permute(0, 2, 3, 1).numpy()
-            return ImagePipelineOutput(images=image)
+            if predict_mask:
+                mask = mask.cpu().permute(0, 2, 3, 1).numpy()
+                return ImagePipelineOutput(images=image), mask
+            else:
+                return ImagePipelineOutput(images=image)
         else:
             image = rearrange(image, '(N T) C H W -> N T C H W', N = best_first_preds.shape[0], T = idx_p.shape[0])
             if to_cpu:
                 image = image.cpu()
-            return image
+            if predict_mask:
+                mask = rearrange(mask, '(N T) C H W -> N T C H W', N = best_first_preds.shape[0], T = idx_p.shape[0])
+                if to_cpu:
+                    mask = mask.cpu()
+                return image, mask  # Return tuple: (image, mask) where mask is raw values
+            else:
+                return image
 
 
 def PSNR(x: Tensor, y: Tensor, data_range: Union[float, int] = 1.0, mean_flag: bool = True) -> Tensor:

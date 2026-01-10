@@ -274,8 +274,14 @@ def main(cfg : DictConfig) -> None:
                 # Flatten masks if they exist
                 if has_masks:
                     valid_mask = Vp_mask.flatten(0, 1)  # (N*Tp, H, W)
+                    # Convert binary masks [0, 1] to [-1, 1] for diffusion
+                    valid_mask_norm = valid_mask * 2.0 - 1.0  # (N*Tp, H, W)
                 else:
                     valid_mask = None
+                    valid_mask_norm = None
+
+                # Check if mask prediction is enabled (from config)
+                predict_mask = cfg.Training.get('predict_mask', False) and has_masks
 
                 # Skip steps until we reach the resumed step
                 if cfg.Env.resume_ckpt and epoch == first_epoch and step < resume_step:
@@ -300,40 +306,113 @@ def main(cfg : DictConfig) -> None:
                 # Add noise to the clean images according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
+                
+                # Add noise to masks if predict_mask is enabled
+                noisy_mask = None
+                mask_noise = None
+                if predict_mask:
+                    # Sample noise for masks
+                    mask_noise = torch.randn(valid_mask_norm.shape).to(valid_mask_norm.device)
+                    # Add noise to normalized masks (in [-1, 1] range)
+                    noisy_mask = noise_scheduler.add_noise(valid_mask_norm, mask_noise, timesteps)
+                    # Add channel dimension: (N*Tp, H, W) -> (N*Tp, 1, H, W)
+                    noisy_mask = noisy_mask.unsqueeze(1)
+                
+                # For non-autoregressive mode, we need to concatenate Vo frames with noisy_images
+                # This matches what the pipeline does during inference
+                if not cfg.STDiff.DiffNet.autoregressive:
+                    # Reshape Vo (all observed frames) to concatenate along channel dimension
+                    # Vo: (N, To, C, H, W) -> Vo_reshaped: (N, To*C, H, W)
+                    Vo_reshaped = Vo.view(Vo.shape[0], Vo.shape[1] * Vo.shape[2], Vo.shape[3], Vo.shape[4])  # (N, To*C, H, W)
+                    # Repeat Vo_reshaped for all Tp frames to match batch dimension
+                    # Vo_reshaped: (N, To*C, H, W) -> (N*Tp, To*C, H, W)
+                    Vo_expanded = Vo_reshaped.unsqueeze(1).repeat(1, Vp.shape[1], 1, 1, 1).flatten(0, 1)
+                    # Concatenate noisy_images with Vo_expanded
+                    # If predict_mask, we need to handle mask separately or concatenate it too
+                    if predict_mask and noisy_mask is not None:
+                        # Concatenate image and mask first, then add Vo frames
+                        # noisy_images: (N*Tp, C, H, W), noisy_mask: (N*Tp, 1, H, W)
+                        noisy_images_with_mask = torch.cat([noisy_images, noisy_mask], dim=1)  # (N*Tp, C+1, H, W) = (N*Tp, 2, H, W)
+                        noisy_images = torch.cat([noisy_images_with_mask, Vo_expanded.clamp(-1, 1)], dim=1)  # (N*Tp, 2+To*C, H, W) = (N*Tp, 5, H, W)
+                        # For non-autoregressive, we don't pass noisy_mask separately since it's already in noisy_images
+                        noisy_mask = None
+                    else:
+                        noisy_images = torch.cat([noisy_images, Vo_expanded.clamp(-1, 1)], dim=1)  # (N*Tp, C+To*C, H, W) = (N*Tp, 4, H, W)
+                
                 # Predict the noise residual
-                model_output = model(Vo, idx_o, idx_p, noisy_images, timesteps, Vp, Vo_last_frame).sample
+                model_output = model(Vo, idx_o, idx_p, noisy_images, timesteps, Vp, Vo_last_frame, 
+                                     noisy_mask=noisy_mask, clean_mask=valid_mask_norm.unsqueeze(1) if predict_mask else None,
+                                     predict_mask=predict_mask)
 
                 if cfg.STDiff.Diffusion.prediction_type == "epsilon":
-                    loss_per_pixel = F.l1_loss(model_output, noise, reduction="none")  # (N*Tp, C, H, W)
+                    loss_per_pixel = F.l1_loss(model_output.sample, noise, reduction="none")  # (N*Tp, C, H, W)
                 elif cfg.STDiff.Diffusion.prediction_type == "sample":
                     alpha_t = _extract_into_tensor(
                         noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
                     )
                     snr_weights = alpha_t / (1 - alpha_t)
                     loss_per_pixel = snr_weights * F.l1_loss(
-                        model_output, clean_images, reduction="none"
+                        model_output.sample, clean_images, reduction="none"
                     )  # use SNR weighting from distillation paper
                 else:
                     raise ValueError(f"Unsupported prediction type: {cfg.STDiff.Diffusion.prediction_type}")
                 
-                # Mask invalid pixels if masks are provided
-                if has_masks and valid_mask is not None:
-                    # Expand mask to match loss shape: (N*Tp, C, H, W)
-                    # valid_mask is (N*Tp, H, W), need to add channel dimension
-                    valid_mask_expanded = valid_mask.unsqueeze(1).expand_as(loss_per_pixel)  # (N*Tp, C, H, W)
-                    # Only compute loss on valid pixels
-                    loss = (loss_per_pixel * valid_mask_expanded.float()).sum() / valid_mask_expanded.float().sum().clamp(min=1.0)
+                # Compute image loss
+                image_loss = loss_per_pixel.mean()
+                
+                # Compute mask loss if predict_mask is enabled
+                mask_loss = None
+                if predict_mask and hasattr(model_output, 'mask_sample'):
+                    mask_output = model_output.mask_sample  # (N*Tp, 1, H, W)
+                    if cfg.STDiff.Diffusion.prediction_type == "epsilon":
+                        # Predict noise for mask
+                        mask_loss_per_pixel = F.l1_loss(mask_output, mask_noise.unsqueeze(1), reduction="none")
+                    elif cfg.STDiff.Diffusion.prediction_type == "sample":
+                        # Predict clean mask
+                        alpha_t = _extract_into_tensor(
+                            noise_scheduler.alphas_cumprod, timesteps, (valid_mask_norm.shape[0], 1, 1, 1)
+                        )
+                        snr_weights = alpha_t / (1 - alpha_t)
+                        mask_loss_per_pixel = snr_weights * F.l1_loss(
+                            mask_output, valid_mask_norm.unsqueeze(1), reduction="none"
+                        )
+                    mask_loss = mask_loss_per_pixel.mean()
+                
+                # Combine losses
+                mask_weight = cfg.Training.get('mask_loss_weight', 1.0)
+                if mask_loss is not None:
+                    loss = image_loss + mask_weight * mask_loss
                 else:
-                    # No masks, compute loss on all pixels
-                    loss = loss_per_pixel.mean()
+                    loss = image_loss
+                
+                # Check for NaN or Inf loss
+                if torch.isnan(loss) or torch.isinf(loss):
+                    logger.warning(f"Step {global_step}: NaN/Inf loss detected (loss={loss.item()}), skipping backward pass")
+                    optimizer.zero_grad()
+                    continue
 
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+                    # Check for NaN gradients before clipping
+                    has_nan_grad = False
+                    for param in model.parameters():
+                        if param.grad is not None:
+                            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                has_nan_grad = True
+                                logger.warning(f"Step {global_step}: NaN/Inf gradients detected, skipping optimizer step")
+                                break
+                    
+                    if not has_nan_grad:
+                        max_grad_norm = cfg.Training.get('max_grad_norm', 1.0)
+                        accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
+                        optimizer.step()
+                        lr_scheduler.step()
+                    else:
+                        # Skip optimizer step but still zero gradients
+                        pass
+                    
+                    optimizer.zero_grad()
                 
                 # Clear cache periodically to reduce fragmentation
                 if step % 10 == 0:
@@ -370,6 +449,9 @@ def main(cfg : DictConfig) -> None:
                                         logger.warning(f"Failed to delete checkpoint {old_checkpoint}: {e}")
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
+            if predict_mask and mask_loss is not None:
+                logs["image_loss"] = image_loss.detach().item()
+                logs["mask_loss"] = mask_loss.detach().item()
             if cfg.Training.use_ema:
                 logs["ema_decay"] = ema_model.cur_decay_value
             progress_bar.set_postfix(**logs)
@@ -397,18 +479,42 @@ def main(cfg : DictConfig) -> None:
                 batch = next(iter(train_dataloader))
                 # Handle both regular datasets (5 values) and range images with masks (8 values)
                 if len(batch) == 8:
-                    Vo, _, Vo_last_frame, idx_o, idx_p, _, _, _ = batch
+                    Vo, _, Vo_last_frame, idx_o, idx_p, _, Vp_mask, _ = batch
+                    has_masks = True
                 else:
                     Vo, _, Vo_last_frame, idx_o, idx_p = batch
-                images = pipeline(
-                    Vo,
-                    Vo_last_frame,
-                    idx_o,
-                    idx_p,
-                    generator=generator,
-                    num_inference_steps=cfg.STDiff.Diffusion.ddpm_num_inference_steps,
-                    output_type="numpy"
-                ).images
+                    has_masks = False
+                    Vp_mask = None
+                
+                # Check if mask prediction is enabled
+                predict_mask = cfg.Training.get('predict_mask', False) and has_masks
+                
+                if predict_mask:
+                    images_output, masks = pipeline(
+                        Vo,
+                        Vo_last_frame,
+                        idx_o,
+                        idx_p,
+                        generator=generator,
+                        num_inference_steps=cfg.STDiff.Diffusion.ddpm_num_inference_steps,
+                        output_type="numpy",
+                        predict_mask=True,
+                        Vp_mask=Vp_mask
+                    )
+                    # Extract images from ImagePipelineOutput
+                    images = images_output.images
+                    # masks are raw values, convert to binary for visualization if needed
+                    # For now, just use images
+                else:
+                    images = pipeline(
+                        Vo,
+                        Vo_last_frame,
+                        idx_o,
+                        idx_p,
+                        generator=generator,
+                        num_inference_steps=cfg.STDiff.Diffusion.ddpm_num_inference_steps,
+                        output_type="numpy"
+                    ).images
 
                 if cfg.Training.use_ema:
                     ema_model.restore(unet.parameters())

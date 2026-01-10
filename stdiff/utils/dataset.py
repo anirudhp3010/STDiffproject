@@ -21,8 +21,97 @@ from operator import itemgetter
 from functools import partial
 import random
 from einops import rearrange
+import hashlib
+import json
 
 import cv2
+
+
+def get_global_minmax_cache_key(dataset_dir, test_folder_ids, num_observed_frames, num_predict_frames, use_val):
+    """
+    Generate a cache key for global min/max values based on training sequence configuration.
+    
+    Args:
+        dataset_dir: Path to dataset directory
+        test_folder_ids: List of test folder IDs (determines training sequences)
+        num_observed_frames: Number of observed frames
+        num_predict_frames: Number of predicted frames
+        use_val: Whether validation split is used
+    
+    Returns:
+        str: Cache key (hash)
+    """
+    # Create a unique key from the configuration
+    key_data = {
+        'dataset_dir': str(Path(dataset_dir).absolute()),
+        'test_folder_ids': sorted([int(i) for i in test_folder_ids]),  # Sort for consistency
+        'num_observed_frames': int(num_observed_frames),
+        'num_predict_frames': int(num_predict_frames),
+        'use_val': bool(use_val)
+    }
+    # Create hash from sorted JSON string
+    key_string = json.dumps(key_data, sort_keys=True)
+    cache_key = hashlib.md5(key_string.encode()).hexdigest()
+    return cache_key
+
+
+def load_global_minmax_from_cache(dataset_dir, test_folder_ids, num_observed_frames, num_predict_frames, use_val):
+    """
+    Load global min/max values from cache if available.
+    
+    Returns:
+        tuple: (global_min, global_max) if found, (None, None) otherwise
+    """
+    cache_key = get_global_minmax_cache_key(dataset_dir, test_folder_ids, num_observed_frames, num_predict_frames, use_val)
+    
+    # Store cache in dataset directory under .cache subdirectory
+    cache_dir = Path(dataset_dir) / '.cache'
+    cache_file = cache_dir / f'global_minmax_{cache_key}.json'
+    
+    if cache_file.exists():
+        try:
+            with open(cache_file, 'r') as f:
+                cache_data = json.load(f)
+                global_min = cache_data.get('global_min')
+                global_max = cache_data.get('global_max')
+                if global_min is not None and global_max is not None:
+                    print(f"Loaded global min/max from cache: [{global_min:.6f}, {global_max:.6f}]")
+                    print(f"Cache file: {cache_file}")
+                    return float(global_min), float(global_max)
+        except Exception as e:
+            print(f"Warning: Failed to load cache file {cache_file}: {e}")
+    
+    return None, None
+
+
+def save_global_minmax_to_cache(dataset_dir, test_folder_ids, num_observed_frames, num_predict_frames, use_val, global_min, global_max):
+    """
+    Save global min/max values to cache.
+    """
+    cache_key = get_global_minmax_cache_key(dataset_dir, test_folder_ids, num_observed_frames, num_predict_frames, use_val)
+    
+    # Store cache in dataset directory under .cache subdirectory
+    cache_dir = Path(dataset_dir) / '.cache'
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f'global_minmax_{cache_key}.json'
+    
+    cache_data = {
+        'global_min': float(global_min),
+        'global_max': float(global_max),
+        'dataset_dir': str(Path(dataset_dir).absolute()),
+        'test_folder_ids': sorted([int(i) for i in test_folder_ids]),
+        'num_observed_frames': int(num_observed_frames),
+        'num_predict_frames': int(num_predict_frames),
+        'use_val': bool(use_val)
+    }
+    
+    try:
+        with open(cache_file, 'w') as f:
+            json.dump(cache_data, f, indent=2)
+        print(f"Saved global min/max to cache: [{global_min:.6f}, {global_max:.6f}]")
+        print(f"Cache file: {cache_file}")
+    except Exception as e:
+        print(f"Warning: Failed to save cache file {cache_file}: {e}")
 
 
 class LitDataModule(pl.LightningDataModule):
@@ -122,50 +211,76 @@ class LitDataModule(pl.LightningDataModule):
             if self.cfg.Dataset.name == 'KITTI_RANGE':
                 # Get test folder IDs from config or use default
                 test_folder_ids = self.cfg.Dataset.get("test_folder_ids", [8, 9, 10])
+                # Convert to integers in case YAML parsed them as strings (e.g., [06, 07, 08, 09])
+                test_folder_ids = [int(i) for i in test_folder_ids]
                 # In deploy mode, use all sequences for training (no validation split)
                 # Otherwise, split for validation
                 use_val = self.cfg.Dataset.phase != 'deploy'
                 
-                # First, create dataset without transform to compute global min/max
-                # We'll use a dummy transform for now
-                # Note: Don't pass global_min/global_max here since we're computing them
-                dummy_transform = transforms.Compose([VidToTensor()])
-                KITTIRangeTrainData_temp = KITTIRangeImageDataset(self.cfg.Dataset.dir, test_folder_ids, 
-                                                                   transform = dummy_transform, train = True, val = use_val,
-                                                                   num_observed_frames= self.cfg.Dataset.num_observed_frames, 
-                                                                   num_predict_frames= self.cfg.Dataset.num_predict_frames)
-                if use_val:
-                    train_set_temp, _ = KITTIRangeTrainData_temp()
+                # Try to load global min/max from cache first
+                cached_min, cached_max = load_global_minmax_from_cache(
+                    self.cfg.Dataset.dir, test_folder_ids, 
+                    self.cfg.Dataset.num_observed_frames, 
+                    self.cfg.Dataset.num_predict_frames, 
+                    use_val
+                )
+                
+                if cached_min is not None and cached_max is not None:
+                    # Use cached values
+                    self.range_image_global_min = cached_min
+                    self.range_image_global_max = cached_max
                 else:
-                    train_set_temp = KITTIRangeTrainData_temp()
-                
-                # Compute global min/max from training set (only valid pixels)
-                # Use a sample-based approach for efficiency (sample up to 1000 clips)
-                print("Computing global min/max from training set...")
-                all_valid_pixels = []
-                num_clips_to_sample = min(1000, len(train_set_temp))  # Sample up to 1000 clips
-                sample_indices = random.sample(range(len(train_set_temp)), num_clips_to_sample) if len(train_set_temp) > 1000 else range(len(train_set_temp))
-                
-                for idx in tqdm(sample_indices, desc="Computing global min/max", disable=False):
-                    clip_files = train_set_temp.clips[idx]
-                    for npy_path in clip_files:
-                        range_img = np.load(npy_path.absolute().as_posix())
-                        if len(range_img.shape) > 2:
-                            range_img = range_img.squeeze()
-                        valid_mask = range_img > 0
-                        if valid_mask.any():
-                            all_valid_pixels.extend(range_img[valid_mask].astype(np.float32).tolist())
-                
-                if len(all_valid_pixels) > 0:
-                    all_valid_pixels_array = np.array(all_valid_pixels, dtype=np.float32)
-                    self.range_image_global_min = float(np.min(all_valid_pixels_array))
-                    self.range_image_global_max = float(np.max(all_valid_pixels_array))
-                    print(f"Computed global min from {len(all_valid_pixels)} valid pixels: {self.range_image_global_min:.6f}")
-                    print(f"Computed global max from {len(all_valid_pixels)} valid pixels: {self.range_image_global_max:.6f}")
-                else:
-                    self.range_image_global_min = 0.0
-                    self.range_image_global_max = 85.0
-                    print("Warning: No valid pixels found, using min=0.0, max=85.0")
+                    # Cache miss - compute global min/max from training set
+                    # First, create dataset without transform to compute global min/max
+                    # We'll use a dummy transform for now
+                    # Note: Don't pass global_min/global_max here since we're computing them
+                    dummy_transform = transforms.Compose([VidToTensor()])
+                    KITTIRangeTrainData_temp = KITTIRangeImageDataset(self.cfg.Dataset.dir, test_folder_ids, 
+                                                                       transform = dummy_transform, train = True, val = use_val,
+                                                                       num_observed_frames= self.cfg.Dataset.num_observed_frames, 
+                                                                       num_predict_frames= self.cfg.Dataset.num_predict_frames)
+                    if use_val:
+                        train_set_temp, _ = KITTIRangeTrainData_temp()
+                    else:
+                        train_set_temp = KITTIRangeTrainData_temp()
+                    
+                    # Compute global min/max from training set (only valid pixels)
+                    # Use a sample-based approach for efficiency (sample up to 1000 clips)
+                    print("Computing global min/max from training set...")
+                    all_valid_pixels = []
+                    num_clips_to_sample = min(1000, len(train_set_temp))  # Sample up to 1000 clips
+                    sample_indices = random.sample(range(len(train_set_temp)), num_clips_to_sample) if len(train_set_temp) > 1000 else range(len(train_set_temp))
+                    
+                    for idx in tqdm(sample_indices, desc="Computing global min/max", disable=False):
+                        clip_files = train_set_temp.clips[idx]
+                        for npy_path in clip_files:
+                            range_img = np.load(npy_path.absolute().as_posix())
+                            if len(range_img.shape) > 2:
+                                range_img = range_img.squeeze()
+                            valid_mask = range_img > 0
+                            if valid_mask.any():
+                                all_valid_pixels.extend(range_img[valid_mask].astype(np.float32).tolist())
+                    
+                    if len(all_valid_pixels) > 0:
+                        all_valid_pixels_array = np.array(all_valid_pixels, dtype=np.float32)
+                        self.range_image_global_min = float(np.min(all_valid_pixels_array))
+                        self.range_image_global_max = float(np.max(all_valid_pixels_array))
+                        print(f"Computed global min from {len(all_valid_pixels)} valid pixels: {self.range_image_global_min:.6f}")
+                        print(f"Computed global max from {len(all_valid_pixels)} valid pixels: {self.range_image_global_max:.6f}")
+                        
+                        # Save to cache for future use
+                        save_global_minmax_to_cache(
+                            self.cfg.Dataset.dir, test_folder_ids,
+                            self.cfg.Dataset.num_observed_frames,
+                            self.cfg.Dataset.num_predict_frames,
+                            use_val,
+                            self.range_image_global_min,
+                            self.range_image_global_max
+                        )
+                    else:
+                        self.range_image_global_min = 0.0
+                        self.range_image_global_max = 85.0
+                        print("Warning: No valid pixels found, using min=0.0, max=85.0")
                 
                 # Now create transforms with global min-max normalization
                 self.train_transform = transforms.Compose([
@@ -258,54 +373,81 @@ class LitDataModule(pl.LightningDataModule):
 
             if self.cfg.Dataset.name == 'KITTI_RANGE':
                 test_folder_ids = self.cfg.Dataset.get("test_folder_ids", [8, 9, 10])
+                # Convert to integers in case YAML parsed them as strings (e.g., [06, 07, 08, 09])
+                test_folder_ids = [int(i) for i in test_folder_ids]
                 # Use global min/max computed during setup (if available)
-                # If not available (e.g., when setup is called with stage="test" only), compute them
+                # If not available (e.g., when setup is called with stage="test" only), try cache or compute them
                 global_min = getattr(self, 'range_image_global_min', None)
                 global_max = getattr(self, 'range_image_global_max', None)
                 
                 if global_min is None or global_max is None:
-                    # Compute global min/max from training set if not already computed
-                    print("Computing global min/max for test dataset...")
-                    dummy_transform = transforms.Compose([VidToTensor()])
+                    # Try to load from cache first
                     use_val = self.cfg.Dataset.phase != 'deploy'
-                    KITTIRangeTrainData_temp = KITTIRangeImageDataset(self.cfg.Dataset.dir, test_folder_ids, 
-                                                                       transform = dummy_transform, train = True, val = use_val,
-                                                                       num_observed_frames= self.cfg.Dataset.num_observed_frames, 
-                                                                       num_predict_frames= self.cfg.Dataset.num_predict_frames)
-                    if use_val:
-                        train_set_temp, _ = KITTIRangeTrainData_temp()
-                    else:
-                        train_set_temp = KITTIRangeTrainData_temp()
+                    cached_min, cached_max = load_global_minmax_from_cache(
+                        self.cfg.Dataset.dir, test_folder_ids,
+                        self.cfg.Dataset.num_observed_frames,
+                        self.cfg.Dataset.num_predict_frames,
+                        use_val
+                    )
                     
-                    # Compute global min/max from training set (only valid pixels)
-                    all_valid_pixels = []
-                    num_clips_to_sample = min(1000, len(train_set_temp))
-                    sample_indices = random.sample(range(len(train_set_temp)), num_clips_to_sample) if len(train_set_temp) > 1000 else range(len(train_set_temp))
-                    
-                    for idx in tqdm(sample_indices, desc="Computing global min/max", disable=False):
-                        clip_files = train_set_temp.clips[idx]
-                        for npy_path in clip_files:
-                            range_img = np.load(npy_path.absolute().as_posix())
-                            if len(range_img.shape) > 2:
-                                range_img = range_img.squeeze()
-                            valid_mask = range_img > 0
-                            if valid_mask.any():
-                                all_valid_pixels.extend(range_img[valid_mask].astype(np.float32).tolist())
-                    
-                    if len(all_valid_pixels) > 0:
-                        all_valid_pixels_array = np.array(all_valid_pixels, dtype=np.float32)
-                        global_min = float(np.min(all_valid_pixels_array))
-                        global_max = float(np.max(all_valid_pixels_array))
+                    if cached_min is not None and cached_max is not None:
+                        # Use cached values
+                        global_min = cached_min
+                        global_max = cached_max
                         self.range_image_global_min = global_min
                         self.range_image_global_max = global_max
-                        print(f"Computed global min from {len(all_valid_pixels)} valid pixels: {global_min:.6f}")
-                        print(f"Computed global max from {len(all_valid_pixels)} valid pixels: {global_max:.6f}")
                     else:
-                        global_min = 0.0
-                        global_max = 85.0
-                        self.range_image_global_min = global_min
-                        self.range_image_global_max = global_max
-                        print("Warning: No valid pixels found, using min=0.0, max=85.0")
+                        # Cache miss - compute global min/max from training set
+                        print("Computing global min/max for test dataset...")
+                        dummy_transform = transforms.Compose([VidToTensor()])
+                        KITTIRangeTrainData_temp = KITTIRangeImageDataset(self.cfg.Dataset.dir, test_folder_ids, 
+                                                                           transform = dummy_transform, train = True, val = use_val,
+                                                                           num_observed_frames= self.cfg.Dataset.num_observed_frames, 
+                                                                           num_predict_frames= self.cfg.Dataset.num_predict_frames)
+                        if use_val:
+                            train_set_temp, _ = KITTIRangeTrainData_temp()
+                        else:
+                            train_set_temp = KITTIRangeTrainData_temp()
+                        
+                        # Compute global min/max from training set (only valid pixels)
+                        all_valid_pixels = []
+                        num_clips_to_sample = min(1000, len(train_set_temp))
+                        sample_indices = random.sample(range(len(train_set_temp)), num_clips_to_sample) if len(train_set_temp) > 1000 else range(len(train_set_temp))
+                        
+                        for idx in tqdm(sample_indices, desc="Computing global min/max", disable=False):
+                            clip_files = train_set_temp.clips[idx]
+                            for npy_path in clip_files:
+                                range_img = np.load(npy_path.absolute().as_posix())
+                                if len(range_img.shape) > 2:
+                                    range_img = range_img.squeeze()
+                                valid_mask = range_img > 0
+                                if valid_mask.any():
+                                    all_valid_pixels.extend(range_img[valid_mask].astype(np.float32).tolist())
+                        
+                        if len(all_valid_pixels) > 0:
+                            all_valid_pixels_array = np.array(all_valid_pixels, dtype=np.float32)
+                            global_min = float(np.min(all_valid_pixels_array))
+                            global_max = float(np.max(all_valid_pixels_array))
+                            self.range_image_global_min = global_min
+                            self.range_image_global_max = global_max
+                            print(f"Computed global min from {len(all_valid_pixels)} valid pixels: {global_min:.6f}")
+                            print(f"Computed global max from {len(all_valid_pixels)} valid pixels: {global_max:.6f}")
+                            
+                            # Save to cache for future use
+                            save_global_minmax_to_cache(
+                                self.cfg.Dataset.dir, test_folder_ids,
+                                self.cfg.Dataset.num_observed_frames,
+                                self.cfg.Dataset.num_predict_frames,
+                                use_val,
+                                global_min,
+                                global_max
+                            )
+                        else:
+                            global_min = 0.0
+                            global_max = 85.0
+                            self.range_image_global_min = global_min
+                            self.range_image_global_max = global_max
+                            print("Warning: No valid pixels found, using min=0.0, max=85.0")
                 
                 KITTIRangeTestData = KITTIRangeImageDataset(self.cfg.Dataset.dir, test_folder_ids,
                                                             transform = self.test_transform, train = False, val = False,
@@ -548,6 +690,9 @@ class KITTIDataset(object):
         self.KITTI_path = Path(KITTI_dir).absolute()
         self.train = train
         self.val = val
+
+        # Convert test_folder_ids to integers in case they're strings (e.g., from YAML with leading zeros)
+        test_folder_ids = [int(i) for i in test_folder_ids]
 
         self.all_folders = sorted(os.listdir(self.KITTI_path))
         self.num_examples = len(self.all_folders)
@@ -1273,6 +1418,9 @@ class KITTIRangeImageDataset(object):
         self.train = train
         self.val = val
 
+        # Convert test_folder_ids to integers in case they're strings (e.g., from YAML with leading zeros)
+        test_folder_ids = [int(i) for i in test_folder_ids]
+
         # Get all sequence folders (00, 01, 02, etc.)
         self.all_folders = sorted([f for f in os.listdir(self.KITTI_path) 
                                    if os.path.isdir(self.KITTI_path / f) and f.isdigit()])
@@ -1358,11 +1506,15 @@ class KITTIRangeImageDataset(object):
         return clips
 
 
-def visualize_batch_clips(gt_past_frames_batch, gt_future_frames_batch, pred_frames_batch, file_dir, renorm_transform = None, desc = None):
+def visualize_batch_clips(gt_past_frames_batch, gt_future_frames_batch, pred_frames_batch, file_dir, renorm_transform = None, desc = None,
+                          pred_masks_batch=None, gt_future_masks_batch=None, gt_past_masks_batch=None):
     """
         pred_frames_batch: tensor with shape (N, future_clip_length, C, H, W)
         gt_future_frames_batch: tensor with shape (N, future_clip_length, C, H, W)
         gt_past_frames_batch: tensor with shape (N, past_clip_length, C, H, W)
+        pred_masks_batch: optional tensor with shape (N, future_clip_length, 1, H, W) - raw mask values
+        gt_future_masks_batch: optional tensor with shape (N, future_clip_length, 1, H, W) - binary masks
+        gt_past_masks_batch: optional tensor with shape (N, past_clip_length, 1, H, W) - binary masks
     """
     if not Path(file_dir).exists():
         Path(file_dir).mkdir(parents=True, exist_ok=True) 
@@ -1379,8 +1531,10 @@ def visualize_batch_clips(gt_past_frames_batch, gt_future_frames_batch, pred_fra
     
     def append_frames(batch, max_clip_length):
         d = max_clip_length - batch.shape[1]
-        batch = torch.cat([batch, batch[:, -2:-1, :, :, :].repeat(1, d, 1, 1, 1)], dim = 1)
+        if d > 0:
+            batch = torch.cat([batch, batch[:, -1:, :, :, :].repeat(1, d, 1, 1, 1)], dim = 1)
         return batch
+    
     max_length = max(gt_future_frames_batch.shape[1], gt_past_frames_batch.shape[1])
     max_length = max(max_length, pred_frames_batch.shape[1])
     if gt_past_frames_batch.shape[1] < max_length:
@@ -1390,10 +1544,85 @@ def visualize_batch_clips(gt_past_frames_batch, gt_future_frames_batch, pred_fra
     if pred_frames_batch.shape[1] < max_length:    
         pred_frames_batch = append_frames(pred_frames_batch, max_length)
 
-    batch = torch.cat([gt_past_frames_batch, gt_future_frames_batch, pred_frames_batch], dim = -1) #shape (N, clip_length, C, H, 3W)
-    batch = batch.cpu()
-    N = batch.shape[0]
+    # Prepare image batch (horizontal concatenation: past | future GT | future pred)
+    image_batch = torch.cat([gt_past_frames_batch, gt_future_frames_batch, pred_frames_batch], dim = -1) #shape (N, clip_length, C, H, 3W)
+    image_batch = image_batch.cpu()
+    
+    # Prepare masks if provided
+    mask_batch_3ch = None
+    if pred_masks_batch is not None or gt_future_masks_batch is not None or gt_past_masks_batch is not None:
+        # Prepare mask batches
+        mask_batches = []
+        
+        if gt_past_masks_batch is not None:
+            mask_batches.append(gt_past_masks_batch)
+        if gt_future_masks_batch is not None:
+            mask_batches.append(gt_future_masks_batch)
+        if pred_masks_batch is not None:
+            # pred_masks_batch is in [0, 1] range (already normalized in test script from raw [-1, 1])
+            # Convert to binary by thresholding at 0.5: values > 0.5 become 1.0, values <= 0.5 become 0.0
+            pred_masks_binary = (pred_masks_batch > 0.5).float()
+            mask_batches.append(pred_masks_binary)
+        
+        if len(mask_batches) > 0:
+            # Find max length for masks
+            max_mask_length = max([mb.shape[1] for mb in mask_batches] + [max_length])
+            
+            # Append frames to match max length
+            mask_batches_padded = []
+            for mb in mask_batches:
+                if mb.shape[1] < max_mask_length:
+                    mb = append_frames(mb, max_mask_length)
+                mask_batches_padded.append(mb)
+            
+            # Concatenate masks horizontally (past masks | future GT masks | future pred masks)
+            mask_batch = torch.cat(mask_batches_padded, dim = -1)  # shape (N, clip_length, 1, H, num_masks*W)
+            mask_batch = mask_batch.cpu()
+            
+            # Convert single channel mask to 3-channel for visualization (grayscale)
+            # Repeat channel dimension: (N, T, 1, H, W) -> (N, T, 3, H, W)
+            mask_batch_3ch = mask_batch.repeat(1, 1, 3, 1, 1)  # (N, clip_length, 3, H, num_masks*W)
+    
+    # Create combined GIFs with images on top and masks below (vertical concatenation)
+    N = image_batch.shape[0]
     for n in range(N):
-        clip = batch[n, ...]
-        file_name = file_dir.joinpath(f'{desc}_clip_{n}.gif')
-        save_clip(clip, file_name)
+        if mask_batch_3ch is not None:
+            # Get image clip: (clip_length, C, H, 3W)
+            image_clip = image_batch[n, ...]
+            # Get mask clip: (clip_length, 3, H, num_masks*W)
+            mask_clip = mask_batch_3ch[n, ...]
+            
+            # Ensure same width for vertical concatenation
+            img_width = image_clip.shape[-1]  # 3W
+            mask_width = mask_clip.shape[-1]  # num_masks*W
+            
+            if mask_width != img_width:
+                # Resize mask to match image width
+                # mask_clip: (T, 3, H, W) -> need to resize width dimension
+                T, C, H, W = mask_clip.shape
+                mask_clip_resized = torch.nn.functional.interpolate(
+                    mask_clip,  # (T, 3, H, W)
+                    size=(H, img_width),
+                    mode='bilinear',
+                    align_corners=False
+                )  # (T, 3, H, img_width)
+                mask_clip = mask_clip_resized
+            
+            # Concatenate vertically: images on top, masks below
+            # image_clip: (T, C, H, W), mask_clip: (T, 3, H, W)
+            # Result: (T, 3, 2H, W) - images on top, masks below
+            if image_clip.shape[1] == 1:
+                # Convert grayscale image to RGB
+                image_clip = image_clip.repeat(1, 3, 1, 1)  # (T, 3, H, W)
+            
+            # Concatenate along height dimension (dim=-2): images on top, masks below
+            combined_clip = torch.cat([image_clip, mask_clip], dim = -2)  # (T, 3, 2H, W)
+        else:
+            # No masks, just use images
+            combined_clip = image_batch[n, ...]
+            if combined_clip.shape[1] == 1:
+                # Convert grayscale to RGB
+                combined_clip = combined_clip.repeat(1, 3, 1, 1)
+        
+        file_name = file_dir.joinpath(f'{desc}_clip_{n}.gif' if desc else f'clip_{n}.gif')
+        save_clip(combined_clip, file_name)
