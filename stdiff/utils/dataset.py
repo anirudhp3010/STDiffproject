@@ -229,6 +229,28 @@ class LitDataModule(pl.LightningDataModule):
                     # Use cached values
                     self.range_image_global_min = cached_min
                     self.range_image_global_max = cached_max
+                    # Build transforms and train/val sets (same as cache-miss path)
+                    self.train_transform = transforms.Compose([
+                        VidResize((self.kitti_range_resize_size[0], self.kitti_range_resize_size[1])),
+                        VidToTensor(),
+                        self.norm_transform
+                    ])
+                    self.test_transform = transforms.Compose([
+                        VidResize((self.kitti_range_resize_size[0], self.kitti_range_resize_size[1])),
+                        VidToTensor(),
+                        self.norm_transform
+                    ])
+                    KITTIRangeTrainData = KITTIRangeImageDataset(self.cfg.Dataset.dir, test_folder_ids,
+                                                                 transform=self.train_transform, train=True, val=use_val,
+                                                                 num_observed_frames=self.cfg.Dataset.num_observed_frames,
+                                                                 num_predict_frames=self.cfg.Dataset.num_predict_frames,
+                                                                 global_min=self.range_image_global_min,
+                                                                 global_max=self.range_image_global_max)
+                    if use_val:
+                        self.train_set, self.val_set = KITTIRangeTrainData()
+                    else:
+                        self.train_set = KITTIRangeTrainData()
+                        self.val_set = None
                 else:
                     # Cache miss - compute global min/max from training set
                     # First, create dataset without transform to compute global min/max
@@ -281,31 +303,31 @@ class LitDataModule(pl.LightningDataModule):
                         self.range_image_global_min = 0.0
                         self.range_image_global_max = 85.0
                         print("Warning: No valid pixels found, using min=0.0, max=85.0")
-                
-                # Now create transforms with global min-max normalization
-                self.train_transform = transforms.Compose([
-                    VidResize((self.kitti_range_resize_size[0], self.kitti_range_resize_size[1])),
-                    VidToTensor(),
-                    self.norm_transform
-                ])
-                self.test_transform = transforms.Compose([
-                    VidResize((self.kitti_range_resize_size[0], self.kitti_range_resize_size[1])),
-                    VidToTensor(),
-                    self.norm_transform
-                ])
-                
-                # Create actual datasets with proper transforms and global min/max
-                KITTIRangeTrainData = KITTIRangeImageDataset(self.cfg.Dataset.dir, test_folder_ids, 
-                                                             transform = self.train_transform, train = True, val = use_val,
+                    
+                    # Now create transforms with global min-max normalization
+                    self.train_transform = transforms.Compose([
+                        VidResize((self.kitti_range_resize_size[0], self.kitti_range_resize_size[1])),
+                        VidToTensor(),
+                        self.norm_transform
+                    ])
+                    self.test_transform = transforms.Compose([
+                        VidResize((self.kitti_range_resize_size[0], self.kitti_range_resize_size[1])),
+                        VidToTensor(),
+                        self.norm_transform
+                    ])
+                    
+                    # Create actual datasets with proper transforms and global min/max
+                    KITTIRangeTrainData = KITTIRangeImageDataset(self.cfg.Dataset.dir, test_folder_ids, 
+                                                                 transform = self.train_transform, train = True, val = use_val,
                                                              num_observed_frames= self.cfg.Dataset.num_observed_frames, 
                                                              num_predict_frames= self.cfg.Dataset.num_predict_frames,
                                                              global_min=self.range_image_global_min, 
                                                              global_max=self.range_image_global_max)
-                if use_val:
-                    self.train_set, self.val_set = KITTIRangeTrainData()
-                else:
-                    self.train_set = KITTIRangeTrainData()
-                    self.val_set = None
+                    if use_val:
+                        self.train_set, self.val_set = KITTIRangeTrainData()
+                    else:
+                        self.train_set = KITTIRangeTrainData()
+                        self.val_set = None
 
             if self.cfg.Dataset.name == 'BAIR':
                 BAIR_train_whole_set = BAIRDataset(Path(self.cfg.Dataset.dir).joinpath('train'), self.train_transform, color_mode = 'RGB', 
@@ -342,24 +364,30 @@ class LitDataModule(pl.LightningDataModule):
 
             #Use all training dataset for the final training
             if self.cfg.Dataset.phase == 'deploy':
-                if self.val_set is not None:
+                if hasattr(self, 'val_set') and self.val_set is not None:
                     self.train_set = ConcatDataset([self.train_set, self.val_set])
                 # If val_set is None, train_set already contains all data
 
             dev_set_size = self.cfg.Dataset.dev_set_size
             if dev_set_size is not None:
                 self.train_set, _ = random_split(self.train_set, [dev_set_size, len(self.train_set) - dev_set_size], generator=torch.Generator().manual_seed(2021))
-                if self.val_set is not None:
+                if hasattr(self, 'val_set') and self.val_set is not None:
                     self.val_set, _ = random_split(self.val_set, [dev_set_size, len(self.val_set) - dev_set_size], generator=torch.Generator().manual_seed(2021))
             
-            self.len_train_loader = len(self.train_dataloader())
-            if self.val_set is not None:
-                self.len_val_loader = len(self.val_dataloader())
+            # Only compute train/val loader lengths if train_set exists (i.e., in fit stage)
+            if hasattr(self, 'train_set'):
+                self.len_train_loader = len(self.train_dataloader())
+                if hasattr(self, 'val_set') and self.val_set is not None:
+                    self.len_val_loader = len(self.val_dataloader())
+                else:
+                    self.len_val_loader = 0
             else:
+                # In test stage, train_set doesn't exist
+                self.len_train_loader = 0
                 self.len_val_loader = 0
 
-        # Assign Test split(s) for use in Dataloaders
-        if stage in (None, "test"):
+        # Assign Test split(s) for use in Dataloaders (also when stage="fit" so test_loader is available)
+        if stage in (None, "fit", "test"):
             if self.cfg.Dataset.name == 'KTH':
                 KTHTestData = KTHDataset(self.cfg.Dataset.dir, transform = self.test_transform, train = False, val = False, 
                                         num_observed_frames= self.cfg.Dataset.test_num_observed_frames, num_predict_frames= self.cfg.Dataset.test_num_predict_frames)#, actions = ['walking_no_empty'])
@@ -375,6 +403,12 @@ class LitDataModule(pl.LightningDataModule):
                 test_folder_ids = self.cfg.Dataset.get("test_folder_ids", [8, 9, 10])
                 # Convert to integers in case YAML parsed them as strings (e.g., [06, 07, 08, 09])
                 test_folder_ids = [int(i) for i in test_folder_ids]
+                
+                # Initialize transforms if they don't exist (needed when stage="test" only)
+                if not hasattr(self, 'test_transform') or self.test_transform is None:
+                    # Transforms need global min/max, so we'll set them up after we get those values
+                    pass  # Will be set up below after global min/max are determined
+                
                 # Use global min/max computed during setup (if available)
                 # If not available (e.g., when setup is called with stage="test" only), try cache or compute them
                 global_min = getattr(self, 'range_image_global_min', None)
@@ -449,6 +483,14 @@ class LitDataModule(pl.LightningDataModule):
                             self.range_image_global_max = global_max
                             print("Warning: No valid pixels found, using min=0.0, max=85.0")
                 
+                # Create test_transform if it doesn't exist (needed when stage="test" only)
+                if not hasattr(self, 'test_transform') or self.test_transform is None:
+                    self.test_transform = transforms.Compose([
+                        VidResize((self.kitti_range_resize_size[0], self.kitti_range_resize_size[1])),
+                        VidToTensor(),
+                        self.norm_transform
+                    ])
+                
                 KITTIRangeTestData = KITTIRangeImageDataset(self.cfg.Dataset.dir, test_folder_ids,
                                                             transform = self.test_transform, train = False, val = False,
                                                             num_observed_frames= self.cfg.Dataset.test_num_observed_frames, 
@@ -479,6 +521,8 @@ class LitDataModule(pl.LightningDataModule):
             self.len_test_loader = len(self.test_dataloader())
 
     def train_dataloader(self):
+        if not hasattr(self, 'train_set') or self.train_set is None:
+            return None
         return DataLoader(self.train_set, shuffle = True, batch_size=self.cfg.Dataset.batch_size, num_workers=self.cfg.Dataset.num_workers, drop_last = True, collate_fn = self.collate_fn)
 
     def val_dataloader(self):
@@ -491,11 +535,22 @@ class LitDataModule(pl.LightningDataModule):
         return DataLoader(self.test_set, shuffle = False, batch_size=self.cfg.Dataset.batch_size, num_workers=self.cfg.Dataset.num_workers, drop_last = False, collate_fn = self.collate_fn)
 
 
-def get_lightning_module_dataloader(cfg):
+def get_lightning_module_dataloader(cfg, stage=None):
     pl_datamodule = LitDataModule(cfg)
-    pl_datamodule.setup()
-    train_loader = pl_datamodule.train_dataloader()
-    val_loader = pl_datamodule.val_dataloader()
+    # If stage not provided: use "fit" when phase != 'deploy', else "test" (test script only needs test set)
+    # Caller can pass stage="fit" for training (need train set) or stage="test" for testing only
+    if stage is None:
+        stage = "fit" if cfg.Dataset.phase != 'deploy' else "test"
+    pl_datamodule.setup(stage=stage)
+    
+    # Only create loaders for datasets that exist
+    train_loader = None
+    val_loader = None
+    if hasattr(pl_datamodule, 'train_set') and pl_datamodule.train_set is not None:
+        train_loader = pl_datamodule.train_dataloader()
+    if hasattr(pl_datamodule, 'val_set') and pl_datamodule.val_set is not None:
+        val_loader = pl_datamodule.val_dataloader()
+    
     test_loader = pl_datamodule.test_dataloader()
     # Return datamodule as well so we can access global min/max for KITTI_RANGE
     return train_loader, val_loader, test_loader, pl_datamodule
@@ -1555,12 +1610,21 @@ def visualize_batch_clips(gt_past_frames_batch, gt_future_frames_batch, pred_fra
         mask_batches = []
         
         if gt_past_masks_batch is not None:
+            # Convert to float if boolean: (N, T, 1, H, W)
+            if gt_past_masks_batch.dtype == torch.bool:
+                gt_past_masks_batch = gt_past_masks_batch.float()
             mask_batches.append(gt_past_masks_batch)
         if gt_future_masks_batch is not None:
+            # Convert to float if boolean: (N, T, 1, H, W)
+            if gt_future_masks_batch.dtype == torch.bool:
+                gt_future_masks_batch = gt_future_masks_batch.float()
             mask_batches.append(gt_future_masks_batch)
         if pred_masks_batch is not None:
             # pred_masks_batch is in [0, 1] range (already normalized in test script from raw [-1, 1])
             # Convert to binary by thresholding at 0.5: values > 0.5 become 1.0, values <= 0.5 become 0.0
+            # Ensure it's float type
+            if pred_masks_batch.dtype == torch.bool:
+                pred_masks_batch = pred_masks_batch.float()
             pred_masks_binary = (pred_masks_batch > 0.5).float()
             mask_batches.append(pred_masks_binary)
         
@@ -1578,6 +1642,10 @@ def visualize_batch_clips(gt_past_frames_batch, gt_future_frames_batch, pred_fra
             # Concatenate masks horizontally (past masks | future GT masks | future pred masks)
             mask_batch = torch.cat(mask_batches_padded, dim = -1)  # shape (N, clip_length, 1, H, num_masks*W)
             mask_batch = mask_batch.cpu()
+            
+            # Ensure mask_batch is float type for interpolation
+            if mask_batch.dtype != torch.float32:
+                mask_batch = mask_batch.float()
             
             # Convert single channel mask to 3-channel for visualization (grayscale)
             # Repeat channel dimension: (N, T, 1, H, W) -> (N, T, 3, H, W)
@@ -1600,6 +1668,9 @@ def visualize_batch_clips(gt_past_frames_batch, gt_future_frames_batch, pred_fra
                 # Resize mask to match image width
                 # mask_clip: (T, 3, H, W) -> need to resize width dimension
                 T, C, H, W = mask_clip.shape
+                # Ensure mask_clip is float for interpolation
+                if mask_clip.dtype != torch.float32:
+                    mask_clip = mask_clip.float()
                 mask_clip_resized = torch.nn.functional.interpolate(
                     mask_clip,  # (T, 3, H, W)
                     size=(H, img_width),

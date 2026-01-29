@@ -38,17 +38,32 @@ def main(cfg : DictConfig) -> None:
     # Handle checkpoint loading - support both checkpoint directories and model directories
     # If ckpt_path points to a checkpoint directory (e.g., checkpoint-6), load from unet subfolder
     # Otherwise, load from stdiff subfolder (legacy format)
+    # Check if EMA weights should be loaded
+    use_ema = cfg.TestCfg.scheduler.get('ema', False)
     checkpoint_dir = Path(ckpt_path)
     if checkpoint_dir.is_dir() and checkpoint_dir.name.startswith('checkpoint-'):
         # Loading from a training checkpoint directory
-        unet_path = checkpoint_dir / 'unet'
-        if unet_path.exists():
-            print(f"Loading model from checkpoint directory: {ckpt_path}/unet")
-            stdiff = STDiffDiffusers.from_pretrained(str(unet_path)).eval()
+        if use_ema:
+            # Load EMA weights from unet_ema subfolder
+            unet_path = checkpoint_dir / 'unet_ema'
+            if unet_path.exists():
+                print(f"Loading EMA model from checkpoint directory: {ckpt_path}/unet_ema")
+                stdiff = STDiffDiffusers.from_pretrained(str(unet_path)).eval()
+            else:
+                raise FileNotFoundError(f"EMA model not found in checkpoint directory: {unet_path}. Make sure the checkpoint was saved with EMA enabled during training.")
         else:
-            raise FileNotFoundError(f"Model not found in checkpoint directory: {unet_path}")
+            # Load regular weights from unet subfolder
+            unet_path = checkpoint_dir / 'unet'
+            if unet_path.exists():
+                print(f"Loading model from checkpoint directory: {ckpt_path}/unet")
+                stdiff = STDiffDiffusers.from_pretrained(str(unet_path)).eval()
+            else:
+                raise FileNotFoundError(f"Model not found in checkpoint directory: {unet_path}")
     else:
         # Legacy format: loading from model directory with stdiff subfolder
+        # Note: Legacy format may not support EMA, so we only check for regular weights
+        if use_ema:
+            print(f"Warning: EMA requested but checkpoint path doesn't appear to be a checkpoint directory. Attempting to load from stdiff subfolder (may not have EMA weights).")
         stdiff = STDiffDiffusers.from_pretrained(ckpt_path, subfolder='stdiff').eval()
     #Print the number of parameters
     num_params = sum(p.numel() for p in stdiff.parameters() if p.requires_grad)
@@ -196,9 +211,9 @@ def main(cfg : DictConfig) -> None:
                     else:
                         filter_first_out = stdiff_pipeline.filter_best_first_pred(
                             cfg.TestCfg.random_predict.first_pred_sample_num, Vo.clone(), 
-                            Vo_last_frame, Vp[:, 0:1, ...], idx_o, idx_p, 
-                            num_inference_steps = cfg.TestCfg.scheduler.sample_steps,
-                            fix_init_noise=cfg.TestCfg.random_predict.fix_init_noise,
+                                                                            Vo_last_frame, Vp[:, 0:1, ...], idx_o, idx_p, 
+                                                                            num_inference_steps = cfg.TestCfg.scheduler.sample_steps,
+                                                                            fix_init_noise=cfg.TestCfg.random_predict.fix_init_noise,
                             bs = cfg.TestCfg.random_predict.first_pred_parralle_bs
                         )
                 
@@ -245,6 +260,10 @@ def main(cfg : DictConfig) -> None:
                                     num_inference_steps = cfg.TestCfg.scheduler.sample_steps,
                                     to_cpu=False, fix_init_noise=cfg.TestCfg.random_predict.fix_init_noise
                                 ) #Torch Tensor (N, Tp, C, H, W), range [0, 1]
+                        
+                        # Check if temp_pred is None (should not happen, but safety check)
+                        if temp_pred is None:
+                            raise ValueError(f"Pipeline returned None for batch {idx}, sample {i}, iteration {j}. This should not happen.")
                         
                         pred_clip.append(temp_pred)
                         if predict_mask:
@@ -326,14 +345,13 @@ def main(cfg : DictConfig) -> None:
                             # Normalize to [0, 1] for visualization (will be converted to binary in visualize function)
                             pred_masks_vis = (pred_masks_vis + 1.0) / 2.0
                         
-                        if has_masks and g_Vp_mask is not None:
+                        # Only pass GT masks to visualization when predict_mask is True (otherwise no mask row in GIF)
+                        if predict_mask and has_masks and g_Vp_mask is not None:
                             # Vp_mask: (N, Tp, H, W) - binary [0, 1]
-                            # Add channel dimension for visualization
                             gt_future_masks_vis = g_Vp_mask.unsqueeze(2)  # (N, Tp, 1, H, W)
                         
-                        if has_masks and g_Vo_mask is not None:
+                        if predict_mask and has_masks and g_Vo_mask is not None:
                             # Vo_mask: (N, To, H, W) - binary [0, 1]
-                            # Add channel dimension
                             gt_past_masks_vis = g_Vo_mask.unsqueeze(2)  # (N, To, 1, H, W)
                         
                         visualize_batch_clips(

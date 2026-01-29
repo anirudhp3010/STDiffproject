@@ -1,9 +1,8 @@
 Env:
-    # Resume from kitti_range_64x512_old/checkpoint-300800 (output_dir must contain the checkpoint)
-    output_dir: '/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_old'
+    # With-mask training: separate output dir from nomask
+    output_dir: '/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask'
     logger: 'tensorboard'
-    # Checkpoint dir name under output_dir (accelerator.load_state(output_dir/resume_ckpt))
-    resume_ckpt: 'checkpoint-300800'
+    resume_ckpt: null  # Set to checkpoint path if resuming
     stdiff_init_ckpt: null
     
 
@@ -23,7 +22,7 @@ Dataset:
     rand_Tp: 3
     rand_predict: True
     half_fps: False
-    test_folder_ids: [9]  # Folder indices for testing (sequences 08, 09, 10)
+    test_folder_ids: [06,07,08,09]  # Folder indices for testing (sequences 08, 09, 10)
 
 STDiff:
     Diffusion:
@@ -33,19 +32,21 @@ STDiff:
         ddpm_beta_schedule: "squaredcos_cap_v2"
 
         unet_config:
-            # Must match checkpoint-300800 architecture (autoregressive: in_channels=2 = prev_frame + current)
-            sample_size: [64, 512]
-            in_channels: 2   # Autoregressive: 1 previous frame + 1 current
-            out_channels: 1  # Grayscale only (no mask)
+            sample_size: [64, 512]  # Non-square: 64 height x 512 width
+            # WITH MASK: non-autoregressive, predict_mask=True
+            # in_channels = out_channels (2: image+mask) + To*C (3*1) = 5
+            in_channels: 5
+            out_channels: 2  # 1 image + 1 mask
             m_channels: 256
             layers_per_block: 2
-            block_out_channels: [128, 256, 256, 512, 512]  # From checkpoint
+            #config for resolution 64x512
+            block_out_channels: [128, 256, 512, 768, 1024]
             down_block_types: ["DownBlock2D","AttnDownBlock2D","AttnDownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D"]
             up_block_types: ["AttnUpBlock2D", "AttnUpBlock2D","AttnUpBlock2D", "AttnUpBlock2D", "UpBlock2D"]
-            attention_head_dim: [null, 128, 128, 128, 128]  # From checkpoint
+            attention_head_dim: [null, 32, 64, 192, 256]
 
     DiffNet:
-        autoregressive: True  # Must match checkpoint-300800
+        autoregressive: False
         super_res_training: False
         MotionEncoder:
             learn_diff_image: True
@@ -97,6 +98,6 @@ Training:
     use_xformers: True  # Enable xformers memory efficient attention (requires xformers package)
     
     # Mask prediction settings
-    predict_mask: False  # Enable mask prediction (requires masks in dataset)
+    predict_mask: True   # Enable mask prediction (requires masks in dataset)
     mask_loss_weight: 1.0  # Weight for mask loss relative to image loss
 

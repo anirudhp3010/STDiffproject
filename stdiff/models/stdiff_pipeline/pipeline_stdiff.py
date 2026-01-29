@@ -294,6 +294,8 @@ class STDiffPipeline(DiffusionPipeline):
                     pred_image = rearrange(pred_image, '(N T) C H W -> N T C H W', N = Vo.shape[0], T = idx_p.shape[0])
                     if to_cpu:
                         pred_image = pred_image.cpu()
+                    if pred_image is None:
+                        raise ValueError("Pipeline error: pred_image is None in non-autoregressive mode with predict_mask=False")
                     return pred_image
             else:
                 image = rearrange(image, '(N T) C H W -> N T C H W', N = Vo.shape[0], T = idx_p.shape[0])
@@ -305,6 +307,8 @@ class STDiffPipeline(DiffusionPipeline):
                         mask = mask.cpu()
                     return image, mask  # Return tuple: (image, mask) where mask is raw values
                 else:
+                    if image is None:
+                        raise ValueError("Pipeline error: image is None in autoregressive mode with predict_mask=False")
                     return image
     
     def init_noise(self, image_shape, generator):
@@ -518,13 +522,20 @@ class STDiffPipeline(DiffusionPipeline):
             image = rearrange(image, '(N T) C H W -> N T C H W', N = best_first_preds.shape[0], T = idx_p.shape[0])
             if to_cpu:
                 image = image.cpu()
-            if predict_mask:
-                mask = rearrange(mask, '(N T) C H W -> N T C H W', N = best_first_preds.shape[0], T = idx_p.shape[0])
-                if to_cpu:
-                    mask = mask.cpu()
-                return image, mask  # Return tuple: (image, mask) where mask is raw values
+                if predict_mask:
+                    mask = rearrange(mask, '(N T) C H W -> N T C H W', N = best_first_preds.shape[0], T = idx_p.shape[0])
+                    if to_cpu:
+                        mask = mask.cpu()
+                    return image, mask  # Return tuple: (image, mask) where mask is raw values
+                else:
+                    return image
             else:
-                return image
+                # When to_cpu=False, still need to return
+                if predict_mask:
+                    mask = rearrange(mask, '(N T) C H W -> N T C H W', N = best_first_preds.shape[0], T = idx_p.shape[0])
+                    return image, mask  # Return tuple: (image, mask) where mask is raw values
+                else:
+                    return image
 
 
 def PSNR(x: Tensor, y: Tensor, data_range: Union[float, int] = 1.0, mean_flag: bool = True) -> Tensor:

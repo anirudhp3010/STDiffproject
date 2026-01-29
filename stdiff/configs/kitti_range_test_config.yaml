@@ -14,7 +14,7 @@ Dataset:
     rand_Tp: 3
     rand_predict: True
     half_fps: False
-    test_folder_ids: [06,07,08,09]  # Folder indices for testing
+    test_folder_ids: [9]  # Folder indices for testing
 
 STDiff:
     Diffusion:
@@ -75,13 +75,14 @@ STDiff:
 
 TestCfg:
     # Load from checkpoint-6 in the output directory
-    ckpt_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask/checkpoint-2400"
-    test_results_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask/test_results_checkpoint-2400_DDPM_100steps"
+    ckpt_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_old/checkpoint-300800"
+    test_results_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_old/test_results_checkpoint-300800_DDPM_ema_50steps"
     gradient_checkpointing: False  # Enable to save memory during inference
     use_xformers: False  # Enable xformers memory efficient attention (requires xformers package)
     scheduler: 
         name: 'DDPM' #'DPMMS' or 'DDPM'
-        sample_steps: 100  # Match ddpm_num_inference_steps
+        sample_steps: 50  # Match ddpm_num_inference_steps
+        ema: True
 
     fps: 1
     metrics: ['PSNR', 'SSIM', 'LPIPS', 'InterLPIPS']
@@ -92,5 +93,5 @@ TestCfg:
         fix_init_noise: False
     
     # Mask prediction settings
-    predict_mask: True  # Enable mask prediction (requires masks in dataset)
+    predict_mask: False  # Enable mask prediction (requires masks in dataset)
 
