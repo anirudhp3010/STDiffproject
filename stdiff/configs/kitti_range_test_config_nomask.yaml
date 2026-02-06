@@ -62,8 +62,8 @@ STDiff:
                 norm: null
 
 TestCfg:
-    ckpt_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_old/checkpoint-301600"
-    test_results_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_old/test_results_nomask_checkpoint-301600_DDPM_50steps"
+    ckpt_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_old/checkpoint-332000"
+    test_results_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_old/test_results_nomask_checkpoint-332000_DDPM_50steps"
     gradient_checkpointing: False
     use_xformers: False
     scheduler:

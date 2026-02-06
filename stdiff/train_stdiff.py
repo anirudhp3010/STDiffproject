@@ -295,7 +295,7 @@ def main(cfg : DictConfig) -> None:
                     N, Tp, C, H, W = Vp.shape
                     noise = (
                         torch.randn(N, C, H, W).unsqueeze(1).repeat(1, Tp, 1, 1, 1).flatten(0, 1).to(clean_images.device)
-                        + 0.1 * torch.randn(N * Tp, C, 1, 1, device=clean_images.device)
+                        + 0.15 * torch.randn(N * Tp, C, 1, 1, device=clean_images.device)
                     )
                     Vo_last_frame = None
 
@@ -303,7 +303,7 @@ def main(cfg : DictConfig) -> None:
                     bsz, C, H, W = clean_images.shape
                     noise = (
                         torch.randn(clean_images.shape).to(clean_images.device)
-                        + 0.1 * torch.randn(bsz, C, 1, 1, device=clean_images.device)
+                        + 0.15 * torch.randn(bsz, C, 1, 1, device=clean_images.device)
                     )
                 bsz = clean_images.shape[0]
                 # Sample a random timestep for each image

@@ -3,7 +3,7 @@ Env:
     output_dir: '/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_old'
     logger: 'tensorboard'
     # Checkpoint dir name under output_dir (accelerator.load_state(output_dir/resume_ckpt))
-    resume_ckpt: 'checkpoint-301600'
+    resume_ckpt: 'checkpoint-320800'
     stdiff_init_ckpt: null
     
 
