@@ -19,6 +19,7 @@ from accelerate.utils import ProjectConfiguration
 from packaging import version
 from tqdm.auto import tqdm
 import argparse
+import gc
 
 import diffusers
 from diffusers import DDPMScheduler
@@ -295,7 +296,7 @@ def main(cfg : DictConfig) -> None:
                     N, Tp, C, H, W = Vp.shape
                     noise = (
                         torch.randn(N, C, H, W).unsqueeze(1).repeat(1, Tp, 1, 1, 1).flatten(0, 1).to(clean_images.device)
-                        + 0.15 * torch.randn(N * Tp, C, 1, 1, device=clean_images.device)
+                        + 0.05 * torch.randn(N * Tp, C, 1, 1, device=clean_images.device)
                     )
                     Vo_last_frame = None
 
@@ -303,7 +304,7 @@ def main(cfg : DictConfig) -> None:
                     bsz, C, H, W = clean_images.shape
                     noise = (
                         torch.randn(clean_images.shape).to(clean_images.device)
-                        + 0.15 * torch.randn(bsz, C, 1, 1, device=clean_images.device)
+                        + 0.05 * torch.randn(bsz, C, 1, 1, device=clean_images.device)
                     )
                 bsz = clean_images.shape[0]
                 # Sample a random timestep for each image
@@ -422,9 +423,11 @@ def main(cfg : DictConfig) -> None:
                     
                     optimizer.zero_grad()
                 
-                # Clear cache periodically to reduce fragmentation
+                # Garbage collect and clear CUDA cache periodically to reduce fragmentation
                 if step % 10 == 0:
-                    torch.cuda.empty_cache()
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:

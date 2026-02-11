@@ -24,9 +24,9 @@ STDiff:
         ddpm_beta_schedule: "squaredcos_cap_v2"
 
         unet_config:
-            # No-mask: autoregressive, in_channels=2 (prev + current), out_channels=1
+            # Non-autoregressive (match trained model): in_channels = 1 + To*C = 4, out_channels=1
             sample_size: [64, 512]
-            in_channels: 2   # Autoregressive: 1 previous frame + 1 current
+            in_channels: 4   # Non-autoregressive: 1 current + 3 past frames (To=3, C=1)
             out_channels: 1  # Grayscale only (no mask)
             m_channels: 256
             layers_per_block: 2
@@ -36,7 +36,7 @@ STDiff:
             attention_head_dim: [null, 128, 128, 128, 128]
 
     DiffNet:
-        autoregressive: True
+        autoregressive: False  # Must match trained non-autoregressive checkpoint
         super_res_training: False
         MotionEncoder:
             learn_diff_image: True
@@ -62,8 +62,9 @@ STDiff:
                 norm: null
 
 TestCfg:
-    ckpt_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_old/checkpoint-332000"
-    test_results_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_old/test_results_nomask_checkpoint-332000_DDPM_50steps"
+    # Point to your non-autoregressive checkpoint (e.g. checkpoint-800, checkpoint-1600, ...)
+    ckpt_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_auto_fa/checkpoint-24800"
+    test_results_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_auto_fa/test_results_nomask_24800_DDPM_50steps"
     gradient_checkpointing: False
     use_xformers: False
     scheduler:
@@ -74,9 +75,10 @@ TestCfg:
     fps: 1
     metrics: ['PSNR', 'SSIM', 'LPIPS', 'InterLPIPS']
     random_predict:
-        first_pred_sample_num: 3
-        first_pred_parralle_bs: 3
-        sample_num: 3
+        # first_pred_sample_num=1 → one pipeline call (no best-of-3). sample_num=1 → one trajectory per batch → 1 denoising loop (50 steps) per batch.
+        first_pred_sample_num: 1
+        first_pred_parralle_bs: 1
+        sample_num: 1
         fix_init_noise: False
 
     predict_mask: False  # No mask prediction
