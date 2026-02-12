@@ -250,8 +250,7 @@ class STDiffPipeline(DiffusionPipeline):
             # For non-autoregressive, image is already split
             if predict_mask:
                 pred_image = (pred_image / 2 + 0.5).clamp(0, 1)
-                # Mask is in [-1, 1] range from denoising, keep as raw values (no sigmoid, no thresholding)
-                # Caller can apply: mask = torch.sigmoid(pred_mask) then threshold if needed
+                # Mask is in [0, 1] range from denoising, keep as raw values (threshold at 0.5 for binary)
                 pred_mask = pred_mask  # Keep raw values
             else:
                 pred_image = (pred_image / 2 + 0.5).clamp(0, 1)
@@ -259,7 +258,7 @@ class STDiffPipeline(DiffusionPipeline):
             # For autoregressive, image and mask are already split
             if predict_mask:
                 image = (image / 2 + 0.5).clamp(0, 1)
-                # Mask is in [-1, 1] range from denoising, keep as raw values
+                # Mask is in [0, 1] range from denoising, keep as raw values (threshold at 0.5 for binary)
                 mask = mask  # Keep raw values
             else:
                 image = (image / 2 + 0.5).clamp(0, 1)

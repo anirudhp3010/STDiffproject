@@ -3,7 +3,7 @@ Env:
     # Use kitti_range_test_config_wmask.yaml for inference
     output_dir: '/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask'
     logger: 'tensorboard'
-    resume_ckpt: null  # Set to checkpoint path if resuming
+    resume_ckpt: "checkpoint-8000" # Set to checkpoint path if resuming
     stdiff_init_ckpt: null
     
 
@@ -100,5 +100,5 @@ Training:
     
     # Mask prediction settings
     predict_mask: True   # Enable mask prediction (requires masks in dataset)
-    mask_loss_weight: 1.0  # Weight for mask loss relative to image loss
+    mask_loss_weight: 3.0  # Weight for mask loss relative to image loss
 

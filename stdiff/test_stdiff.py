@@ -324,9 +324,9 @@ def main(cfg : DictConfig) -> None:
                     # Add mask for ground truth predictions (Vp_mask) if available
                     if g_Vp_mask is not None:
                         dump_obj['g_Vp_mask'] = g_Vp_mask.detach().cpu()
-                    # Add predicted masks if available (threshold > 0 -> binary {1, -1})
+                    # Add predicted masks if available (threshold > 0.5 -> binary {1, 0})
                     if g_preds_mask is not None:
-                        preds_mask_binary = torch.where(g_preds_mask > 0, 1.0, -1.0)
+                        preds_mask_binary = torch.where(g_preds_mask > 0.5, 1.0, 0.0)
                         dump_obj['g_Preds_mask'] = preds_mask_binary.detach().cpu()
                     # Add global min/max for KITTI_RANGE (for evaluation)
                     if cfg.Dataset.name == 'KITTI_RANGE' and global_min is not None and global_max is not None:
@@ -341,10 +341,9 @@ def main(cfg : DictConfig) -> None:
                         gt_past_masks_vis = None
                         
                         if predict_mask and g_preds_mask is not None:
-                            # preds_mask: (N, sample_num, Tp, 1, H, W) - raw values in [-1, 1]
+                            # preds_mask: (N, sample_num, Tp, 1, H, W) - raw values in [0, 1]
                             pred_masks_vis = g_preds_mask[:, i, ...]  # (N, Tp, 1, H, W)
-                            # Normalize to [0, 1] for visualization (will be converted to binary in visualize function)
-                            pred_masks_vis = (pred_masks_vis + 1.0) / 2.0
+                            # Already in [0, 1], will be thresholded to binary in visualize function
                         
                         # Only pass GT masks to visualization when predict_mask is True (otherwise no mask row in GIF)
                         if predict_mask and has_masks and g_Vp_mask is not None:

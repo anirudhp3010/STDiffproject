@@ -275,8 +275,8 @@ def main(cfg : DictConfig) -> None:
                 # Flatten masks if they exist
                 if has_masks:
                     valid_mask = Vp_mask.flatten(0, 1)  # (N*Tp, H, W)
-                    # Convert binary masks [0, 1] to [-1, 1] for diffusion
-                    valid_mask_norm = valid_mask * 2.0 - 1.0  # (N*Tp, H, W)
+                    # Keep binary masks as [0, 1]: valid=1, invalid=0
+                    valid_mask_norm = valid_mask.float()  # (N*Tp, H, W)
                 else:
                     valid_mask = None
                     valid_mask_norm = None
