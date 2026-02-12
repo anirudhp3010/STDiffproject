@@ -324,9 +324,10 @@ def main(cfg : DictConfig) -> None:
                     # Add mask for ground truth predictions (Vp_mask) if available
                     if g_Vp_mask is not None:
                         dump_obj['g_Vp_mask'] = g_Vp_mask.detach().cpu()
-                    # Add predicted masks if available
+                    # Add predicted masks if available (threshold > 0 -> binary {1, -1})
                     if g_preds_mask is not None:
-                        dump_obj['g_Preds_mask'] = g_preds_mask.detach().cpu()
+                        preds_mask_binary = torch.where(g_preds_mask > 0, 1.0, -1.0)
+                        dump_obj['g_Preds_mask'] = preds_mask_binary.detach().cpu()
                     # Add global min/max for KITTI_RANGE (for evaluation)
                     if cfg.Dataset.name == 'KITTI_RANGE' and global_min is not None and global_max is not None:
                         dump_obj['global_min'] = global_min

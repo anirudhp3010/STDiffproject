@@ -1,1 +1,1 @@
-nohup python3 -u ./stdiff/train_stdiff.py --train_config ./stdiff/configs/kitti_range_train_config.yaml > ./stdiff/logs/train.log 2>&1 &
+nohup python3 -u ./stdiff/train_stdiff.py --train_config ./stdiff/configs/kitti_range_train_config_wmask.yaml > ./stdiff/logs/train.log 2>&1 &

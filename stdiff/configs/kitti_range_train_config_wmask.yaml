@@ -1,5 +1,6 @@
 Env:
-    # With-mask training: separate output dir from nomask
+    # KITTI Range training WITH MASK prediction (predict_mask=True)
+    # Use kitti_range_test_config_wmask.yaml for inference
     output_dir: '/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask'
     logger: 'tensorboard'
     resume_ckpt: null  # Set to checkpoint path if resuming
@@ -22,7 +23,7 @@ Dataset:
     rand_Tp: 3
     rand_predict: True
     half_fps: False
-    test_folder_ids: [06,07,08,09]  # Folder indices for testing (sequences 08, 09, 10)
+    test_folder_ids: [9]  # Folder indices for testing (sequences 08, 09, 10)
 
 STDiff:
     Diffusion:
@@ -40,10 +41,10 @@ STDiff:
             m_channels: 256
             layers_per_block: 2
             #config for resolution 64x512
-            block_out_channels: [128, 256, 512, 768, 1024]
+            block_out_channels: [128, 256, 256, 512, 512]
             down_block_types: ["DownBlock2D","AttnDownBlock2D","AttnDownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D"]
             up_block_types: ["AttnUpBlock2D", "AttnUpBlock2D","AttnUpBlock2D", "AttnUpBlock2D", "UpBlock2D"]
-            attention_head_dim: [null, 32, 64, 192, 256]
+            attention_head_dim: [null, 128, 128, 128, 128]
 
     DiffNet:
         autoregressive: False
