@@ -370,22 +370,14 @@ def main(cfg : DictConfig) -> None:
                 image_loss = loss_per_pixel.mean()
                 
                 # Compute mask loss if predict_mask is enabled
+                # Mask uses BCEWithLogitsLoss (binary cross entropy) for valid/invalid classification
                 mask_loss = None
                 if predict_mask and hasattr(model_output, 'mask_sample'):
-                    mask_output = model_output.mask_sample  # (N*Tp, 1, H, W)
-                    if cfg.STDiff.Diffusion.prediction_type == "epsilon":
-                        # Predict noise for mask
-                        mask_loss_per_pixel = F.l1_loss(mask_output, mask_noise.unsqueeze(1), reduction="none")
-                    elif cfg.STDiff.Diffusion.prediction_type == "sample":
-                        # Predict clean mask
-                        alpha_t = _extract_into_tensor(
-                            noise_scheduler.alphas_cumprod, timesteps, (valid_mask_norm.shape[0], 1, 1, 1)
-                        )
-                        snr_weights = alpha_t / (1 - alpha_t)
-                        mask_loss_per_pixel = snr_weights * F.l1_loss(
-                            mask_output, valid_mask_norm.unsqueeze(1), reduction="none"
-                        )
-                    mask_loss = mask_loss_per_pixel.mean()
+                    mask_output = model_output.mask_sample  # (N*Tp, 1, H, W) - logits
+                    mask_target = valid_mask_norm.unsqueeze(1)  # (N*Tp, 1, H, W) - binary [0, 1]
+                    mask_loss = F.binary_cross_entropy_with_logits(
+                        mask_output, mask_target.float(), reduction="mean"
+                    )
                 
                 # Combine losses
                 mask_weight = cfg.Training.get('mask_loss_weight', 1.0)

@@ -151,11 +151,11 @@ class STDiffPipeline(DiffusionPipeline):
                 # Concatenated: (N*Tp, out_channels + To*C, H, W) = (N*Tp, in_channels, H, W)
                 unet_input = torch.cat([image, Vo_expanded.clamp(-1, 1)], dim=1)
                 
-                # 1. predict noise model_output
+                # 1. predict model_output (image: epsilon or sample per config, mask: always sample)
                 model_output = self.stdiff.diffusion_unet(unet_input, t, m_feat = m_future.permute(1, 0, 2, 3, 4).flatten(0, 1)).sample
+                model_output = self._prepare_model_output_for_scheduler(model_output, image, t, predict_mask)
 
                 # 2. compute previous image: x_t -> x_t-1
-                #image = self.scheduler.step(model_output, t, image, generator=generator).prev_sample
                 image = self.scheduler.step(model_output, t, image).prev_sample
             
             # Split image and mask if predict_mask (for non-autoregressive mode)
@@ -221,13 +221,12 @@ class STDiffPipeline(DiffusionPipeline):
                     # image already contains both channels if predict_mask (out_channels=2)
                 
                 for t in self.progress_bar(self.scheduler.timesteps):
-                    # 1. predict noise model_output
-                    # Concatenate image (which may contain mask) with prev_frame
+                    # 1. predict model_output (image: epsilon or sample per config, mask: always sample)
                     unet_input = torch.cat([image, prev_frame.clamp(-1, 1)], dim = 1)
                     model_output = self.stdiff.diffusion_unet(unet_input, t, m_feat = m_future[tp, ...]).sample
+                    model_output = self._prepare_model_output_for_scheduler(model_output, image, t, predict_mask)
 
                     # 2. compute previous image: x_t -> x_t-1
-                    #image = self.scheduler.step(model_output, t, image, generator=generator).prev_sample
                     image = self.scheduler.step(model_output, t, image).prev_sample
 
                 # Split image and mask if predict_mask
@@ -310,6 +309,26 @@ class STDiffPipeline(DiffusionPipeline):
                         raise ValueError("Pipeline error: image is None in autoregressive mode with predict_mask=False")
                     return image
     
+    def _prepare_model_output_for_scheduler(self, model_output, sample, timestep, predict_mask):
+        """When predict_mask=True, mask channel predicts sample (x0) regardless of scheduler prediction_type.
+        If scheduler expects epsilon, convert mask sample prediction to epsilon for correct denoising."""
+        if not predict_mask or model_output.shape[1] < 2:
+            return model_output
+        pred_type = getattr(self.scheduler.config, "prediction_type", "epsilon")
+        if pred_type != "epsilon":
+            return model_output
+        # Mask channel: model predicts x0 (sample), scheduler expects epsilon. Convert: eps = (x_t - sqrt(alpha)*x0) / sqrt(1-alpha)
+        alpha_prod_t = self.scheduler.alphas_cumprod[timestep]
+        if not isinstance(alpha_prod_t, torch.Tensor):
+            alpha_prod_t = torch.tensor(alpha_prod_t, device=model_output.device, dtype=model_output.dtype)
+        alpha_prod_t = alpha_prod_t.to(model_output.device).expand(model_output.shape[0], 1, 1, 1)
+        sqrt_alpha = alpha_prod_t ** 0.5
+        sqrt_one_minus_alpha = (1 - alpha_prod_t + 1e-8) ** 0.5
+        mask_x0 = model_output[:, 1:2, ...]
+        mask_xt = sample[:, 1:2, ...]
+        mask_eps = (mask_xt - sqrt_alpha * mask_x0) / sqrt_one_minus_alpha
+        return torch.cat([model_output[:, 0:1, ...], mask_eps], dim=1)
+
     def init_noise(self, image_shape, generator):
         if self.device.type == "mps":
             # randn does not work reproducibly on mps
@@ -386,9 +405,9 @@ class STDiffPipeline(DiffusionPipeline):
                     # Autoregressive: concatenate with last frame only
                     unet_input = torch.cat([image, prev_frame.repeat(rn, 1, 1, 1).clamp(-1, 1)], dim = 1)
                 model_output = self.stdiff.diffusion_unet(unet_input, t, m_feat = m_first.flatten(0, 1)).sample
+                model_output = self._prepare_model_output_for_scheduler(model_output, image, t, predict_mask)
 
                 # 2. compute previous image: x_t -> x_t-1
-                #image = self.scheduler.step(model_output, t, image, generator=generator).prev_sample
                 image = self.scheduler.step(model_output, t, image).prev_sample
             
             # Split image and mask if predict_mask
@@ -485,15 +504,14 @@ class STDiffPipeline(DiffusionPipeline):
                 # 1. predict noise model_output
                 if not self.stdiff.autoreg:
                     # Non-autoregressive: concatenate with all Vo frames
-                    # image: (N, out_channels, H, W), Vo_reshaped: (N, To*C, H, W)
                     unet_input = torch.cat([image, Vo_reshaped.clamp(-1, 1)], dim=1)
                 else:
                     # Autoregressive: concatenate with previous frame only
                     unet_input = torch.cat([image, prev_frame.clamp(-1, 1)], dim = 1)
                 model_output = self.stdiff.diffusion_unet(unet_input, t, m_feat = m_future[tp-1, ...]).sample
+                model_output = self._prepare_model_output_for_scheduler(model_output, image, t, predict_mask)
 
                 # 2. compute previous image: x_t -> x_t-1
-                #image = self.scheduler.step(model_output, t, image, generator=generator).prev_sample
                 image = self.scheduler.step(model_output, t, image).prev_sample
 
             # Split image and mask if predict_mask

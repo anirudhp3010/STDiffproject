@@ -3,7 +3,7 @@ Env:
     # Use kitti_range_test_config_wmask.yaml for inference
     output_dir: '/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask'
     logger: 'tensorboard'
-    resume_ckpt: "checkpoint-8000" # Set to checkpoint path if resuming
+    resume_ckpt: null # Set to checkpoint path if resuming
     stdiff_init_ckpt: null
     
 
@@ -12,7 +12,7 @@ Dataset:
     dir: '/DATA/common/kitti/processed_data'
     phase: 'deploy'
     dev_set_size: null
-    batch_size: 1 # Reduced for range images
+    batch_size: 2 # Reduced for range images
     num_workers: 3
     num_channels: 1  # Grayscale range images
     image_size: [64, 512]  # Range images: 64 height x 512 width
@@ -90,7 +90,7 @@ Training:
     epochs: 400
     save_images_epochs: 4
     save_model_epochs: 2
-    checkpointing_steps: 800 #number of steps to save a resuming checkpoint
+    checkpointing_steps: 400 #number of steps to save a resuming checkpoint
     max_checkpoints_to_keep: 3  # Automatically delete old checkpoints, keep only latest N
 
     gradient_accumulation_steps: 3 # Increased to maintain effective batch size
@@ -100,5 +100,5 @@ Training:
     
     # Mask prediction settings
     predict_mask: True   # Enable mask prediction (requires masks in dataset)
-    mask_loss_weight: 3.0  # Weight for mask loss relative to image loss
+    mask_loss_weight: 1.0  # Weight for mask loss relative to image loss
 
