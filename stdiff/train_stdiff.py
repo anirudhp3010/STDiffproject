@@ -24,6 +24,7 @@ import gc
 import diffusers
 from diffusers import DDPMScheduler
 from diffusers.optimization import get_scheduler
+
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, is_accelerate_version, is_tensorboard_available
 
@@ -34,7 +35,7 @@ from hydra import initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
 
 from utils import get_lightning_module_dataloader
-from models import STDiffDiffusers, STDiffPipeline
+from models import STDiffDiffusers, STDiffPipeline, FlowMatchingNoiseAdder, EulerFlowScheduler
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.15.0.dev0")
@@ -174,16 +175,26 @@ def main(cfg : DictConfig) -> None:
             model_config=model.config,
         )
 
-    # Initialize the scheduler
-    accepts_prediction_type = "prediction_type" in set(inspect.signature(DDPMScheduler.__init__).parameters.keys())
-    if accepts_prediction_type:
-        noise_scheduler = DDPMScheduler(
-            num_train_timesteps=cfg.STDiff.Diffusion.ddpm_num_steps,
-            beta_schedule=cfg.STDiff.Diffusion.ddpm_beta_schedule,
-            prediction_type=cfg.STDiff.Diffusion.prediction_type,
+    # Initialize the scheduler or flow-matching components
+    use_flow_matching = cfg.STDiff.Diffusion.get("prediction_type") == "v"
+    flow_path_type = cfg.STDiff.Diffusion.get("flow_path_type", "linear")
+
+    if use_flow_matching:
+        noise_scheduler = FlowMatchingNoiseAdder(path_type=flow_path_type)
+        inference_scheduler = EulerFlowScheduler(
+            num_inference_steps=cfg.STDiff.Diffusion.ddpm_num_inference_steps
         )
     else:
-        noise_scheduler = DDPMScheduler(num_train_timesteps=cfg.STDiff.Diffusion.ddpm_num_steps, beta_schedule=cfg.STDiff.Diffusion.ddpm_beta_schedule)
+        accepts_prediction_type = "prediction_type" in set(inspect.signature(DDPMScheduler.__init__).parameters.keys())
+        if accepts_prediction_type:
+            noise_scheduler = DDPMScheduler(
+                num_train_timesteps=cfg.STDiff.Diffusion.ddpm_num_steps,
+                beta_schedule=cfg.STDiff.Diffusion.ddpm_beta_schedule,
+                prediction_type=cfg.STDiff.Diffusion.prediction_type,
+            )
+        else:
+            noise_scheduler = DDPMScheduler(num_train_timesteps=cfg.STDiff.Diffusion.ddpm_num_steps, beta_schedule=cfg.STDiff.Diffusion.ddpm_beta_schedule)
+        inference_scheduler = noise_scheduler
 
     # Initialize the optimizer
     optimizer = torch.optim.AdamW(
@@ -307,25 +318,24 @@ def main(cfg : DictConfig) -> None:
                         + 0.1 * torch.randn(bsz, C, 1, 1, device=clean_images.device)
                     )
                 bsz = clean_images.shape[0]
-                # Sample a random timestep for each image
-                timesteps = torch.randint(
-                    0, noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_images.device
-                ).long()
+                # Sample timestep(s): discrete for DDPM, continuous for flow matching
+                if use_flow_matching:
+                    timesteps = torch.rand(bsz, device=clean_images.device, dtype=clean_images.dtype)
+                else:
+                    timesteps = torch.randint(
+                        0, noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_images.device
+                    ).long()
 
-                # Add noise to the clean images according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
+                # Add noise: flow matching uses x_t = alpha_t*x_0 + sigma_t*noise
                 noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
                 
                 # Add noise to masks if predict_mask is enabled
                 noisy_mask = None
                 mask_noise = None
                 if predict_mask:
-                    # Sample noise for masks
                     mask_noise = torch.randn(valid_mask_norm.shape).to(valid_mask_norm.device)
-                    # Add noise to normalized masks (in [-1, 1] range)
                     noisy_mask = noise_scheduler.add_noise(valid_mask_norm, mask_noise, timesteps)
-                    # Add channel dimension: (N*Tp, H, W) -> (N*Tp, 1, H, W)
-                    noisy_mask = noisy_mask.unsqueeze(1)
+                    noisy_mask = noisy_mask.unsqueeze(1)  # (N*Tp, H, W) -> (N*Tp, 1, H, W)
                 
                 # For non-autoregressive mode, we need to concatenate Vo frames with noisy_images
                 # This matches what the pipeline does during inference
@@ -355,7 +365,11 @@ def main(cfg : DictConfig) -> None:
 
                 # Use image channel only for image loss (channel 0 when predict_mask, else full sample)
                 image_output_for_loss = model_output.sample[:, 0:1, ...] if predict_mask else model_output.sample
-                if cfg.STDiff.Diffusion.prediction_type == "epsilon":
+                if use_flow_matching:
+                    # v-prediction: model predicts velocity v = d_alpha_t*x_0 + d_sigma_t*noise
+                    v_target = noise_scheduler.get_velocity_target(clean_images, noise, timesteps)
+                    loss_per_pixel = F.l1_loss(image_output_for_loss, v_target, reduction="none")
+                elif cfg.STDiff.Diffusion.prediction_type == "epsilon":
                     loss_per_pixel = F.l1_loss(image_output_for_loss, noise, reduction="none")  # (N*Tp, C, H, W)
                 elif cfg.STDiff.Diffusion.prediction_type == "sample":
                     alpha_t = _extract_into_tensor(
@@ -371,14 +385,21 @@ def main(cfg : DictConfig) -> None:
                 # Compute image loss
                 image_loss = loss_per_pixel.mean()
                 
-                # Compute mask loss if predict_mask is enabled (model keeps full 2-channel sample)
+                # Compute mask loss if predict_mask is enabled
                 mask_loss = None
                 if predict_mask:
-                    mask_output = model_output.sample[:, 1:2, ...]  # (N*Tp, 1, H, W) - mask logits
-                    mask_target = valid_mask_norm.unsqueeze(1)  # (N*Tp, 1, H, W) - binary [0, 1]
-                    mask_loss = F.binary_cross_entropy_with_logits(
-                        mask_output, mask_target.float(), reduction="mean"
-                    )
+                    mask_output = model_output.sample[:, 1:2, ...]  # (N*Tp, 1, H, W)
+                    if use_flow_matching:
+                        # Mask also predicts v
+                        mask_v_target = noise_scheduler.get_velocity_target(
+                            valid_mask_norm.unsqueeze(1), mask_noise.unsqueeze(1), timesteps
+                        )
+                        mask_loss = F.l1_loss(mask_output, mask_v_target, reduction="mean")
+                    else:
+                        mask_target = valid_mask_norm.unsqueeze(1)  # (N*Tp, 1, H, W)
+                        mask_loss = F.binary_cross_entropy_with_logits(
+                            mask_output, mask_target.float(), reduction="mean"
+                        )
                 
                 # Combine losses
                 mask_weight = cfg.Training.get('mask_loss_weight', 1.0)
@@ -478,7 +499,7 @@ def main(cfg : DictConfig) -> None:
 
                 pipeline = STDiffPipeline(
                     stdiff=unet,
-                    scheduler=noise_scheduler,
+                    scheduler=inference_scheduler,
                 )
 
                 generator = torch.Generator(device=pipeline.device).manual_seed(0)

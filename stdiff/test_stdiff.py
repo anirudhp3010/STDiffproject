@@ -16,7 +16,7 @@ from einops import rearrange
 from utils import visualize_batch_clips, eval_metrics, LitDataModule
 from pathlib import Path
 import argparse
-from models import STDiffPipeline, STDiffDiffusers
+from models import STDiffPipeline, STDiffDiffusers, EulerFlowScheduler
 from diffusers import DDPMScheduler, DPMSolverMultistepScheduler, PNDMScheduler, DDIMScheduler
 from accelerate import Accelerator
 from tqdm.auto import tqdm
@@ -97,8 +97,7 @@ def main(cfg : DictConfig) -> None:
         scheduler_bin = checkpoint_dir / 'scheduler.bin'
         scheduler_dir = checkpoint_dir / 'scheduler'
         
-        # For testing, we typically want a fresh scheduler with inference settings
-        # Create scheduler from config (this is more appropriate for inference)
+        # Create scheduler from config for inference
         print(f"Creating scheduler from config for inference")
         if cfg.TestCfg.scheduler.name == 'DDPM':
             scheduler = DDPMScheduler(
@@ -107,21 +106,29 @@ def main(cfg : DictConfig) -> None:
                 prediction_type=cfg.STDiff.Diffusion.prediction_type,
             )
         elif cfg.TestCfg.scheduler.name == 'DPMMS':
-            # First load base DDPM scheduler config
             base_scheduler = DDPMScheduler(
                 num_train_timesteps=cfg.STDiff.Diffusion.ddpm_num_steps,
                 beta_schedule=cfg.STDiff.Diffusion.ddpm_beta_schedule,
                 prediction_type=cfg.STDiff.Diffusion.prediction_type,
             )
             scheduler = DPMSolverMultistepScheduler.from_config(base_scheduler.config, solver_order=3)
+        elif cfg.TestCfg.scheduler.name == 'EulerFlow':
+            scheduler = EulerFlowScheduler(
+                num_inference_steps=cfg.TestCfg.scheduler.get('sample_steps', cfg.STDiff.Diffusion.ddpm_num_inference_steps)
+            )
         else:
-            raise NotImplementedError("Scheduler is not supported")
+            raise NotImplementedError(f"Scheduler '{cfg.TestCfg.scheduler.name}' is not supported. Use 'DDPM', 'DPMMS', or 'EulerFlow'.")
     else:
         # Legacy format: loading from model directory
         if cfg.TestCfg.scheduler.name == 'DDPM':
-            scheduler = DDPMScheduler.from_pretrained(ckpt_path, subfolder = 'scheduler')
+            scheduler = DDPMScheduler.from_pretrained(ckpt_path, subfolder='scheduler')
         elif cfg.TestCfg.scheduler.name == 'DPMMS':
             scheduler = DPMSolverMultistepScheduler.from_pretrained(ckpt_path, subfolder="scheduler", solver_order=3)
+        elif cfg.TestCfg.scheduler.name == 'EulerFlow':
+            sched_path = Path(ckpt_path) / 'scheduler'
+            scheduler = EulerFlowScheduler.from_pretrained(sched_path) if sched_path.exists() else EulerFlowScheduler(
+                num_inference_steps=cfg.TestCfg.scheduler.get('sample_steps', cfg.STDiff.Diffusion.ddpm_num_inference_steps)
+            )
         else:
             raise NotImplementedError("Scheduler is not supported")
 

@@ -136,7 +136,7 @@ class STDiffPipeline(DiffusionPipeline):
             # Vo_expanded: (N*Tp, To*C, H, W)
             
             # set step values
-            self.scheduler.set_timesteps(num_inference_steps)
+            self.scheduler.set_timesteps(num_inference_steps, device=getattr(self, "device", None))
 
             # manually extract the future motion feature
             #vo: (N, To, C, H, W), idx_o: (To, ), idx_p: (Tp, ), noisy_Vp: (N*Tp, C, H, W)
@@ -177,7 +177,7 @@ class STDiffPipeline(DiffusionPipeline):
             image_shape = (Vo.shape[0], out_channels, sample_h, sample_w)
             
             # set step values
-            self.scheduler.set_timesteps(num_inference_steps)
+            self.scheduler.set_timesteps(num_inference_steps, device=getattr(self, "device", None))
 
             # manually extract the future motion feature
             #vo: (N, To, C, H, W), idx_o: (To, ), idx_p: (Tp, ), noisy_Vp: (N*Tp, C, H, W)
@@ -201,7 +201,7 @@ class STDiffPipeline(DiffusionPipeline):
             for tp in range(idx_p.shape[0]):
                 # Reset scheduler state for each frame's denoising loop
                 # This is critical for DPMSolverMultistepScheduler which maintains internal state
-                self.scheduler.set_timesteps(num_inference_steps)
+                self.scheduler.set_timesteps(num_inference_steps, device=getattr(self, "device", None))
                 
                 if tp == 0:
                     if self.stdiff.super_res_training:
@@ -310,14 +310,18 @@ class STDiffPipeline(DiffusionPipeline):
                     return image
     
     def _prepare_model_output_for_scheduler(self, model_output, sample, timestep, predict_mask):
-        """When predict_mask=True, mask channel predicts sample (x0) regardless of scheduler prediction_type.
-        If scheduler expects epsilon, convert mask sample prediction to epsilon for correct denoising."""
+        """Convert model output to scheduler expectation.
+        - v-prediction (EulerFlow): model predicts velocity directly, no conversion.
+        - epsilon (DDPM): image predicts epsilon; if predict_mask, mask may predict x0, convert to epsilon."""
+        pred_type = getattr(self.scheduler.config, "prediction_type", "epsilon")
+        if pred_type == "v":
+            # Flow matching: model predicts velocity v directly for both image and mask
+            return model_output
         if not predict_mask or model_output.shape[1] < 2:
             return model_output
-        pred_type = getattr(self.scheduler.config, "prediction_type", "epsilon")
         if pred_type != "epsilon":
             return model_output
-        # Mask channel: model predicts x0 (sample), scheduler expects epsilon. Convert: eps = (x_t - sqrt(alpha)*x0) / sqrt(1-alpha)
+        # Mask channel: model predicts x0 (sample), scheduler expects epsilon
         alpha_prod_t = self.scheduler.alphas_cumprod[timestep]
         if not isinstance(alpha_prod_t, torch.Tensor):
             alpha_prod_t = torch.tensor(alpha_prod_t, device=model_output.device, dtype=model_output.dtype)
@@ -359,7 +363,7 @@ class STDiffPipeline(DiffusionPipeline):
         image_shape = (Vo.shape[0], out_channels, sample_h, sample_w)
         
         # set step values
-        self.scheduler.set_timesteps(num_inference_steps)
+        self.scheduler.set_timesteps(num_inference_steps, device=getattr(self, "device", None))
 
         # manually extract the future motion feature
         #vo: (N, To, C, H, W), idx_o: (To, ), idx_p: (Tp, ), noisy_Vp: (N*Tp, C, H, W)
@@ -387,7 +391,7 @@ class STDiffPipeline(DiffusionPipeline):
         for i in range(num_iter):
             # Reset scheduler state for each batch's denoising loop
             # This is critical when batch sizes differ between iterations
-            self.scheduler.set_timesteps(num_inference_steps)
+            self.scheduler.set_timesteps(num_inference_steps, device=getattr(self, "device", None))
             
             m_first = torch.stack(m_first_all[i*bs:(i+1)*bs], dim = 1)
             rn = m_first.shape[1]

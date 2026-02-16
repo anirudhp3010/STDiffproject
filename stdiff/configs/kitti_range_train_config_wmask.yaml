@@ -3,7 +3,7 @@ Env:
     # Use kitti_range_test_config_wmask.yaml for inference
     output_dir: '/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask'
     logger: 'tensorboard'
-    resume_ckpt: "checkpoint-18300" # Set to checkpoint path if resuming
+    resume_ckpt: "checkpoint-19200" # Set to checkpoint path if resuming
     stdiff_init_ckpt: null
     
 
@@ -13,7 +13,7 @@ Dataset:
     phase: 'deploy'
     dev_set_size: null
     batch_size: 6 # Reduced for range images
-    num_workers: 3
+    num_workers: 8
     num_channels: 1  # Grayscale range images
     image_size: [64, 512]  # Range images: 64 height x 512 width
     num_observed_frames: 3
@@ -27,7 +27,8 @@ Dataset:
 
 STDiff:
     Diffusion:
-        prediction_type: 'epsilon' #'epsilon' or 'sample'
+        prediction_type: 'epsilon' # 'epsilon', 'sample', or 'v' (flow-matching)
+        flow_path_type: 'linear'   # 'linear' or 'cosine' (only used when prediction_type='v')
         ddpm_num_steps: 1000
         ddpm_num_inference_steps: 50
         ddpm_beta_schedule: "squaredcos_cap_v2"
