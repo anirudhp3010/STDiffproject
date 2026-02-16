@@ -66,14 +66,12 @@ class STDiffDiffusers(ModelMixin, ConfigMixin):
         out = self.diffusion_unet(noisy_Vp, timestep, m_feat = m_future.permute(1, 0, 2, 3, 4).flatten(0, 1))
         
         # Split output if predict_mask: out_channels should be 2 (1 image + 1 mask)
+        # Keep full out.sample (2 channels) so training can extract both; set image_sample/mask_sample for pipeline
         if predict_mask:
-            # Split output: channels 0 for image, channel 1 for mask
             image_output = out.sample[:, 0:1, ...]  # (N*Tp, 1, H, W) for grayscale
             mask_output = out.sample[:, 1:2, ...]   # (N*Tp, 1, H, W)
-            # Store both in the output object for backward compatibility
             out.image_sample = image_output
             out.mask_sample = mask_output
-            # Set sample to image for backward compatibility with existing code
-            out.sample = image_output
+            # Do NOT overwrite out.sample - keep full 2-channel for training (loss uses both channels)
         
         return out

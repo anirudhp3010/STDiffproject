@@ -1,6 +1,6 @@
 Dataset:
     name: 'KITTI_RANGE'
-    dir: '/DATA/common/kitti/processed_data'
+    dir: '/DATA/common/kitti/processed_data_64x512'  # Must match training (64x512)
     phase: 'deploy'
     dev_set_size: null
     batch_size: 1  # Reduced for range images

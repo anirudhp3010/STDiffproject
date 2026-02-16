@@ -71,6 +71,8 @@ def calculate_range_image_loss(preds_dir, sample_idx=0, global_min=None, global_
             if 'g_Vp_mask' in data:
                 print(f"  g_Vp_mask shape: {data['g_Vp_mask'].shape}")
                 print(f"  g_Vp_mask valid pixels: {data['g_Vp_mask'].sum().item()} / {data['g_Vp_mask'].numel()}")
+            if 'g_Preds_mask' in data:
+                print(f"  g_Preds_mask shape: {data['g_Preds_mask'].shape}")
             if 'global_min' in data and 'global_max' in data:
                 print(f"  global_min: {data['global_min']:.6f}, global_max: {data['global_max']:.6f}")
         
@@ -149,20 +151,36 @@ def calculate_range_image_loss(preds_dir, sample_idx=0, global_min=None, global_
                 print(f"  Vp range: [{Vp.min().item():.6f}, {Vp.max().item():.6f}], mean: {Vp.mean().item():.6f}")
                 print(f"  preds range: [{preds.min().item():.6f}, {preds.max().item():.6f}], mean: {preds.mean().item():.6f}")
         
-        # Get mask if available
+        # Get mask if available: use g_Vp_mask (GT validity) and g_Preds_mask (pred validity)
+        # When both present: use intersection (pixels valid in both)
+        Vp_mask = None
+        Preds_mask = None
         if 'g_Vp_mask' in data:
-            Vp_mask = data['g_Vp_mask']  # (N, Tp, H, W) - bool tensor: 1 for valid, 0 for invalid
-            # Ensure mask matches the number of frames
+            Vp_mask = data['g_Vp_mask']  # (N, Tp, H, W) - bool: True = valid
             if Vp_mask.shape[1] > num_frames:
                 Vp_mask = Vp_mask[:, :num_frames, ...]
             elif Vp_mask.shape[1] < num_frames:
-                # Pad mask if needed
                 pad_frames = num_frames - Vp_mask.shape[1]
                 Vp_mask = torch.cat([Vp_mask, Vp_mask[:, -1:, ...].repeat(1, pad_frames, 1, 1)], dim=1)
-            if not used_mask:
-                used_mask = True  # Update global flag if mask is found
+        if 'g_Preds_mask' in data:
+            Preds_mask = data['g_Preds_mask']  # (N, sample_num, Tp, 1, H, W) or (N, Tp, 1, H, W)
+            if Preds_mask.ndim == 6:
+                Preds_mask = Preds_mask[:, sample_idx, :num_frames, 0, ...]  # (N, Tp, H, W)
+            elif Preds_mask.ndim == 5:
+                Preds_mask = Preds_mask[:, :num_frames, 0, ...]  # (N, Tp, H, W)
+            Preds_mask = (Preds_mask > 0.5)  # threshold to bool
+        # Combine: use intersection when both, else g_Vp_mask, else g_Preds_mask
+        if Vp_mask is not None and Preds_mask is not None:
+            eval_mask = Vp_mask & Preds_mask
+            used_mask = True
+        elif Vp_mask is not None:
+            eval_mask = Vp_mask
+            used_mask = True
+        elif Preds_mask is not None:
+            eval_mask = Preds_mask
+            used_mask = True
         else:
-            Vp_mask = None
+            eval_mask = None
         
         # Calculate L1 loss per pixel: (N, Tp, C, H, W)
         l1_loss_per_pixel = F.l1_loss(preds, Vp, reduction='none')
@@ -179,48 +197,43 @@ def calculate_range_image_loss(preds_dir, sample_idx=0, global_min=None, global_
         l1_loss_per_frame_no_mask = l1_loss_per_pixel.mean(dim=(2, 3))  # Average over H, W (all pixels)
         
         # Apply mask if available (set invalid pixels to 0 loss)
-        if Vp_mask is not None:
-            # Expand mask to match loss shape: (N, Tp, H, W)
-            Vp_mask_expanded = Vp_mask.float()  # Convert bool to float for multiplication
-            l1_loss_per_pixel_masked = l1_loss_per_pixel * Vp_mask_expanded
+        if eval_mask is not None:
+            eval_mask_expanded = eval_mask.float()  # (N, Tp, H, W)
+            l1_loss_per_pixel_masked = l1_loss_per_pixel * eval_mask_expanded
         else:
             l1_loss_per_pixel_masked = l1_loss_per_pixel  # No mask, use original
-        
+
         # Debug: Print loss statistics for first file
         if file_idx == 0:
             print(f"\n[DEBUG] L1 loss statistics (first file):")
             print(f"  l1_loss_per_pixel (unmasked) shape: {l1_loss_per_pixel.shape}")
             print(f"  l1_loss_per_pixel (unmasked) range: [{l1_loss_per_pixel.min().item():.6f}, {l1_loss_per_pixel.max().item():.6f}]")
-            if Vp_mask is not None:
-                valid_pixels = Vp_mask_expanded.sum().item()
-                total_pixels = Vp_mask_expanded.numel()
-                # l1_loss_per_pixel_masked already has invalid pixels set to 0, so just sum and divide
+            if eval_mask is not None:
+                valid_pixels = eval_mask_expanded.sum().item()
+                total_pixels = eval_mask_expanded.numel()
                 masked_loss = l1_loss_per_pixel_masked.sum() / valid_pixels if valid_pixels > 0 else 0
-                print(f"  Using mask: {valid_pixels}/{total_pixels} valid pixels")
+                mask_src = "g_Vp_mask & g_Preds_mask (intersection)" if (Vp_mask is not None and Preds_mask is not None) else ("g_Vp_mask" if Vp_mask is not None else "g_Preds_mask")
+                print(f"  Using mask ({mask_src}): {valid_pixels}/{total_pixels} valid pixels")
                 print(f"  Masked L1 loss mean (valid pixels only): {masked_loss.item():.6f}")
                 print(f"  Unmasked L1 loss mean (all pixels): {l1_loss_per_pixel.mean().item():.6f}")
             else:
                 print(f"  L1 loss mean (all pixels): {l1_loss_per_pixel.mean().item():.6f}")
-        
+
         # Metric 1 (with mask): L1 loss per frame (average across VALID pixels for each frame)
         # Shape: (N, Tp)
-        if Vp_mask is not None:
-            # Average only over valid pixels (with mask)
-            # Use l1_loss_per_pixel_masked which already has invalid pixels set to 0
-            valid_pixels_per_frame = Vp_mask_expanded.sum(dim=(2, 3))  # (N, Tp) - number of valid pixels per frame
-            l1_loss_per_frame = l1_loss_per_pixel_masked.sum(dim=(2, 3)) / valid_pixels_per_frame.clamp(min=1)  # Average over H, W (valid only)
+        if eval_mask is not None:
+            valid_pixels_per_frame = eval_mask_expanded.sum(dim=(2, 3))  # (N, Tp)
+            l1_loss_per_frame = l1_loss_per_pixel_masked.sum(dim=(2, 3)) / valid_pixels_per_frame.clamp(min=1)
         else:
-            l1_loss_per_frame = l1_loss_per_pixel.mean(dim=(2, 3))  # Average over H, W (all pixels)
-        
+            l1_loss_per_frame = l1_loss_per_pixel.mean(dim=(2, 3))
+
         # Metric 2: L1 loss per pixel (average across frames for each pixel)
         # Shape: (N, H, W)
-        if Vp_mask is not None:
-            # Average only over valid frames for each pixel
-            # Use l1_loss_per_pixel_masked which already has invalid pixels set to 0
-            valid_frames_per_pixel = Vp_mask_expanded.sum(dim=1)  # (N, H, W) - number of valid frames per pixel
-            l1_loss_per_pixel_loc = l1_loss_per_pixel_masked.sum(dim=1) / valid_frames_per_pixel.clamp(min=1)  # Average over Tp (valid only)
+        if eval_mask is not None:
+            valid_frames_per_pixel = eval_mask_expanded.sum(dim=1)  # (N, H, W)
+            l1_loss_per_pixel_loc = l1_loss_per_pixel_masked.sum(dim=1) / valid_frames_per_pixel.clamp(min=1)
         else:
-            l1_loss_per_pixel_loc = l1_loss_per_pixel.mean(dim=1)  # Average over Tp (all frames)
+            l1_loss_per_pixel_loc = l1_loss_per_pixel.mean(dim=1)
         
         # Store results
         all_frame_losses.append(l1_loss_per_frame.cpu())

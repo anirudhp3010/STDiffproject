@@ -296,7 +296,7 @@ def main(cfg : DictConfig) -> None:
                     N, Tp, C, H, W = Vp.shape
                     noise = (
                         torch.randn(N, C, H, W).unsqueeze(1).repeat(1, Tp, 1, 1, 1).flatten(0, 1).to(clean_images.device)
-                        + 0.05 * torch.randn(N * Tp, C, 1, 1, device=clean_images.device)
+                        + 0.1 * torch.randn(N * Tp, C, 1, 1, device=clean_images.device)
                     )
                     Vo_last_frame = None
 
@@ -304,7 +304,7 @@ def main(cfg : DictConfig) -> None:
                     bsz, C, H, W = clean_images.shape
                     noise = (
                         torch.randn(clean_images.shape).to(clean_images.device)
-                        + 0.05 * torch.randn(bsz, C, 1, 1, device=clean_images.device)
+                        + 0.1 * torch.randn(bsz, C, 1, 1, device=clean_images.device)
                     )
                 bsz = clean_images.shape[0]
                 # Sample a random timestep for each image
@@ -353,15 +353,17 @@ def main(cfg : DictConfig) -> None:
                                      noisy_mask=noisy_mask, clean_mask=valid_mask_norm.unsqueeze(1) if predict_mask else None,
                                      predict_mask=predict_mask)
 
+                # Use image channel only for image loss (channel 0 when predict_mask, else full sample)
+                image_output_for_loss = model_output.sample[:, 0:1, ...] if predict_mask else model_output.sample
                 if cfg.STDiff.Diffusion.prediction_type == "epsilon":
-                    loss_per_pixel = F.l1_loss(model_output.sample, noise, reduction="none")  # (N*Tp, C, H, W)
+                    loss_per_pixel = F.l1_loss(image_output_for_loss, noise, reduction="none")  # (N*Tp, C, H, W)
                 elif cfg.STDiff.Diffusion.prediction_type == "sample":
                     alpha_t = _extract_into_tensor(
                         noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
                     )
                     snr_weights = alpha_t / (1 - alpha_t)
                     loss_per_pixel = snr_weights * F.l1_loss(
-                        model_output.sample, clean_images, reduction="none"
+                        image_output_for_loss, clean_images, reduction="none"
                     )  # use SNR weighting from distillation paper
                 else:
                     raise ValueError(f"Unsupported prediction type: {cfg.STDiff.Diffusion.prediction_type}")
@@ -369,11 +371,10 @@ def main(cfg : DictConfig) -> None:
                 # Compute image loss
                 image_loss = loss_per_pixel.mean()
                 
-                # Compute mask loss if predict_mask is enabled
-                # Mask uses BCEWithLogitsLoss (binary cross entropy) for valid/invalid classification
+                # Compute mask loss if predict_mask is enabled (model keeps full 2-channel sample)
                 mask_loss = None
-                if predict_mask and hasattr(model_output, 'mask_sample'):
-                    mask_output = model_output.mask_sample  # (N*Tp, 1, H, W) - logits
+                if predict_mask:
+                    mask_output = model_output.sample[:, 1:2, ...]  # (N*Tp, 1, H, W) - mask logits
                     mask_target = valid_mask_norm.unsqueeze(1)  # (N*Tp, 1, H, W) - binary [0, 1]
                     mask_loss = F.binary_cross_entropy_with_logits(
                         mask_output, mask_target.float(), reduction="mean"
@@ -452,9 +453,12 @@ def main(cfg : DictConfig) -> None:
                                         logger.warning(f"Failed to delete checkpoint {old_checkpoint}: {e}")
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
-            if predict_mask and mask_loss is not None:
-                logs["image_loss"] = image_loss.detach().item()
-                logs["mask_loss"] = mask_loss.detach().item()
+            if cfg.Training.get('predict_mask', False):
+                if mask_loss is not None:
+                    logs["mask_loss"] = round(mask_loss.detach().item(), 4)
+                    logs["image_loss"] = round(image_loss.detach().item(), 4)
+                else:
+                    logs["mask_loss"] = 0.0
             if cfg.Training.use_ema:
                 logs["ema_decay"] = ema_model.cur_decay_value
             progress_bar.set_postfix(**logs)

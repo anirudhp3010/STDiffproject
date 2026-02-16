@@ -229,14 +229,12 @@ class LitDataModule(pl.LightningDataModule):
                     # Use cached values
                     self.range_image_global_min = cached_min
                     self.range_image_global_max = cached_max
-                    # Build transforms and train/val sets (same as cache-miss path)
+                    # Build transforms and train/val sets (no resize - use native .npy resolution)
                     self.train_transform = transforms.Compose([
-                        VidResize((self.kitti_range_resize_size[0], self.kitti_range_resize_size[1])),
                         VidToTensor(),
                         self.norm_transform
                     ])
                     self.test_transform = transforms.Compose([
-                        VidResize((self.kitti_range_resize_size[0], self.kitti_range_resize_size[1])),
                         VidToTensor(),
                         self.norm_transform
                     ])
@@ -304,14 +302,12 @@ class LitDataModule(pl.LightningDataModule):
                         self.range_image_global_max = 85.0
                         print("Warning: No valid pixels found, using min=0.0, max=85.0")
                     
-                    # Now create transforms with global min-max normalization
+                    # Now create transforms with global min-max normalization (no resize - use native .npy resolution)
                     self.train_transform = transforms.Compose([
-                        VidResize((self.kitti_range_resize_size[0], self.kitti_range_resize_size[1])),
                         VidToTensor(),
                         self.norm_transform
                     ])
                     self.test_transform = transforms.Compose([
-                        VidResize((self.kitti_range_resize_size[0], self.kitti_range_resize_size[1])),
                         VidToTensor(),
                         self.norm_transform
                     ])
@@ -483,10 +479,9 @@ class LitDataModule(pl.LightningDataModule):
                             self.range_image_global_max = global_max
                             print("Warning: No valid pixels found, using min=0.0, max=85.0")
                 
-                # Create test_transform if it doesn't exist (needed when stage="test" only)
+                # Create test_transform if it doesn't exist (no resize - use native .npy resolution)
                 if not hasattr(self, 'test_transform') or self.test_transform is None:
                     self.test_transform = transforms.Compose([
-                        VidResize((self.kitti_range_resize_size[0], self.kitti_range_resize_size[1])),
                         VidToTensor(),
                         self.norm_transform
                     ])
