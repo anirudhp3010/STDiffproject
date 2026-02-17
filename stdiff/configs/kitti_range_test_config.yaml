@@ -14,7 +14,9 @@ Dataset:
     rand_Tp: 3
     rand_predict: True
     half_fps: False
-    test_folder_ids: [9]  # Folder indices for testing
+    train_folder_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+    val_folder_ids: [8]
+    test_folder_ids: [9]
 
 STDiff:
     Diffusion:

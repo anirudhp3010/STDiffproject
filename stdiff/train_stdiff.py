@@ -571,9 +571,11 @@ def main(cfg : DictConfig) -> None:
                     ema_model.store(unet.parameters())
                     ema_model.copy_to(unet.parameters())
 
+                # Use inference_scheduler for saving (EulerFlowScheduler for flow-matching;
+                # FlowMatchingNoiseAdder is training-only and doesn't implement save_pretrained)
                 pipeline = STDiffPipeline(
                     stdiff=unet,
-                    scheduler=noise_scheduler
+                    scheduler=inference_scheduler
                 )
 
                 pipeline.save_pretrained(cfg.Env.output_dir)

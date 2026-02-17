@@ -313,7 +313,8 @@ class STDiffPipeline(DiffusionPipeline):
         """Convert model output to scheduler expectation.
         - v-prediction (EulerFlow): model predicts velocity directly, no conversion.
         - epsilon (DDPM): image predicts epsilon; if predict_mask, mask may predict x0, convert to epsilon."""
-        pred_type = getattr(self.scheduler.config, "prediction_type", "epsilon")
+        config = self.scheduler.config
+        pred_type = config.get("prediction_type", "epsilon") if isinstance(config, dict) else getattr(config, "prediction_type", "epsilon")
         if pred_type == "v":
             # Flow matching: model predicts velocity v directly for both image and mask
             return model_output
@@ -321,7 +322,7 @@ class STDiffPipeline(DiffusionPipeline):
             return model_output
         if pred_type != "epsilon":
             return model_output
-        # Mask channel: model predicts x0 (sample), scheduler expects epsilon
+        # Mask channel: model predicts x0 (sample), scheduler expects epsilon (DDPM only)
         alpha_prod_t = self.scheduler.alphas_cumprod[timestep]
         if not isinstance(alpha_prod_t, torch.Tensor):
             alpha_prod_t = torch.tensor(alpha_prod_t, device=model_output.device, dtype=model_output.dtype)

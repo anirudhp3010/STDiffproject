@@ -1,9 +1,9 @@
 Env:
     # KITTI Range training WITH MASK prediction (predict_mask=True)
     # Use kitti_range_test_config_wmask.yaml for inference
-    output_dir: '/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask'
+    output_dir: '/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask_flow_matching'
     logger: 'tensorboard'
-    resume_ckpt: "checkpoint-19200" # Set to checkpoint path if resuming
+    resume_ckpt: null # Set to checkpoint path if resuming
     stdiff_init_ckpt: null
     
 
@@ -13,7 +13,7 @@ Dataset:
     phase: 'deploy'
     dev_set_size: null
     batch_size: 6 # Reduced for range images
-    num_workers: 8
+    num_workers: 12
     num_channels: 1  # Grayscale range images
     image_size: [64, 512]  # Range images: 64 height x 512 width
     num_observed_frames: 3
@@ -23,12 +23,15 @@ Dataset:
     rand_Tp: 3
     rand_predict: True
     half_fps: False
-    test_folder_ids: [9]  # Folder indices for testing (sequences 08, 09, 10)
+    # Explicit folder IDs for train/val/test (indices into sorted sequence folders 00, 01, 02, ...)
+    train_folder_ids: [0,1,2,3,4,5,6,7,8]  # Sequences for training only
+    val_folder_ids: []   # Sequences for validation
+    test_folder_ids: [9] # Sequences for testing
 
 STDiff:
     Diffusion:
-        prediction_type: 'epsilon' # 'epsilon', 'sample', or 'v' (flow-matching)
-        flow_path_type: 'linear'   # 'linear' or 'cosine' (only used when prediction_type='v')
+        prediction_type: 'v' # 'epsilon', 'sample', or 'v' (flow-matching)
+        flow_path_type: 'cosine'   # 'linear' or 'cosine' (only used when prediction_type='v')
         ddpm_num_steps: 1000
         ddpm_num_inference_steps: 50
         ddpm_beta_schedule: "squaredcos_cap_v2"

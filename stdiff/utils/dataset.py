@@ -25,44 +25,48 @@ import hashlib
 import json
 
 import cv2
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for saving
+import matplotlib.pyplot as plt
 
 
-def get_global_minmax_cache_key(dataset_dir, test_folder_ids, num_observed_frames, num_predict_frames, use_val):
+def get_global_minmax_cache_key(dataset_dir, train_folder_ids, num_observed_frames, num_predict_frames, val_folder_ids=None):
     """
     Generate a cache key for global min/max values based on training sequence configuration.
-    
+
     Args:
         dataset_dir: Path to dataset directory
-        test_folder_ids: List of test folder IDs (determines training sequences)
+        train_folder_ids: List of folder IDs used for training (determines cache key)
         num_observed_frames: Number of observed frames
         num_predict_frames: Number of predicted frames
-        use_val: Whether validation split is used
-    
+        val_folder_ids: Optional list of validation folder IDs (for backward compat)
+
     Returns:
         str: Cache key (hash)
     """
     # Create a unique key from the configuration
     key_data = {
         'dataset_dir': str(Path(dataset_dir).absolute()),
-        'test_folder_ids': sorted([int(i) for i in test_folder_ids]),  # Sort for consistency
+        'train_folder_ids': sorted([int(i) for i in train_folder_ids]),  # Sort for consistency
         'num_observed_frames': int(num_observed_frames),
         'num_predict_frames': int(num_predict_frames),
-        'use_val': bool(use_val)
     }
+    if val_folder_ids is not None:
+        key_data['val_folder_ids'] = sorted([int(i) for i in val_folder_ids])
     # Create hash from sorted JSON string
     key_string = json.dumps(key_data, sort_keys=True)
     cache_key = hashlib.md5(key_string.encode()).hexdigest()
     return cache_key
 
 
-def load_global_minmax_from_cache(dataset_dir, test_folder_ids, num_observed_frames, num_predict_frames, use_val):
+def load_global_minmax_from_cache(dataset_dir, train_folder_ids, num_observed_frames, num_predict_frames, val_folder_ids=None):
     """
     Load global min/max values from cache if available.
-    
+
     Returns:
         tuple: (global_min, global_max) if found, (None, None) otherwise
     """
-    cache_key = get_global_minmax_cache_key(dataset_dir, test_folder_ids, num_observed_frames, num_predict_frames, use_val)
+    cache_key = get_global_minmax_cache_key(dataset_dir, train_folder_ids, num_observed_frames, num_predict_frames, val_folder_ids)
     
     # Store cache in dataset directory under .cache subdirectory
     cache_dir = Path(dataset_dir) / '.cache'
@@ -84,11 +88,11 @@ def load_global_minmax_from_cache(dataset_dir, test_folder_ids, num_observed_fra
     return None, None
 
 
-def save_global_minmax_to_cache(dataset_dir, test_folder_ids, num_observed_frames, num_predict_frames, use_val, global_min, global_max):
+def save_global_minmax_to_cache(dataset_dir, train_folder_ids, num_observed_frames, num_predict_frames, val_folder_ids, global_min, global_max):
     """
     Save global min/max values to cache.
     """
-    cache_key = get_global_minmax_cache_key(dataset_dir, test_folder_ids, num_observed_frames, num_predict_frames, use_val)
+    cache_key = get_global_minmax_cache_key(dataset_dir, train_folder_ids, num_observed_frames, num_predict_frames, val_folder_ids)
     
     # Store cache in dataset directory under .cache subdirectory
     cache_dir = Path(dataset_dir) / '.cache'
@@ -99,11 +103,12 @@ def save_global_minmax_to_cache(dataset_dir, test_folder_ids, num_observed_frame
         'global_min': float(global_min),
         'global_max': float(global_max),
         'dataset_dir': str(Path(dataset_dir).absolute()),
-        'test_folder_ids': sorted([int(i) for i in test_folder_ids]),
+        'train_folder_ids': sorted([int(i) for i in train_folder_ids]),
         'num_observed_frames': int(num_observed_frames),
         'num_predict_frames': int(num_predict_frames),
-        'use_val': bool(use_val)
     }
+    if val_folder_ids is not None:
+        cache_data['val_folder_ids'] = sorted([int(i) for i in val_folder_ids])
     
     try:
         with open(cache_file, 'w') as f:
@@ -209,20 +214,34 @@ class LitDataModule(pl.LightningDataModule):
                 self.train_set, self.val_set = KITTITrainData()
 
             if self.cfg.Dataset.name == 'KITTI_RANGE':
-                # Get test folder IDs from config or use default
+                # Get folder IDs: explicit (train/val/test) or legacy (test_folder_ids only)
+                train_folder_ids = self.cfg.Dataset.get("train_folder_ids")
+                val_folder_ids = self.cfg.Dataset.get("val_folder_ids")
                 test_folder_ids = self.cfg.Dataset.get("test_folder_ids", [8, 9, 10])
-                # Convert to integers in case YAML parsed them as strings (e.g., [06, 07, 08, 09])
                 test_folder_ids = [int(i) for i in test_folder_ids]
-                # In deploy mode, use all sequences for training (no validation split)
-                # Otherwise, split for validation
-                use_val = self.cfg.Dataset.phase != 'deploy'
-                
+                use_explicit = train_folder_ids is not None
+                if use_explicit:
+                    train_folder_ids = [int(i) for i in train_folder_ids]
+                    val_folder_ids = [int(i) for i in (val_folder_ids or [])]
+                    use_val = len(val_folder_ids) > 0
+                else:
+                    # Legacy: train = all except test, val = from train split
+                    use_val = self.cfg.Dataset.phase != 'deploy'
+
+                # Cache key: explicit uses train_folder_ids; legacy uses test_folder_ids (train = all except test)
+                if use_explicit:
+                    cache_train_ids = train_folder_ids
+                    cache_val_ids = val_folder_ids
+                else:
+                    cache_train_ids = sorted(i for i in range(20) if i not in test_folder_ids)
+                    cache_val_ids = None
+
                 # Try to load global min/max from cache first
                 cached_min, cached_max = load_global_minmax_from_cache(
-                    self.cfg.Dataset.dir, test_folder_ids, 
-                    self.cfg.Dataset.num_observed_frames, 
-                    self.cfg.Dataset.num_predict_frames, 
-                    use_val
+                    self.cfg.Dataset.dir, cache_train_ids,
+                    self.cfg.Dataset.num_observed_frames,
+                    self.cfg.Dataset.num_predict_frames,
+                    cache_val_ids
                 )
                 
                 if cached_min is not None and cached_max is not None:
@@ -238,12 +257,14 @@ class LitDataModule(pl.LightningDataModule):
                         VidToTensor(),
                         self.norm_transform
                     ])
-                    KITTIRangeTrainData = KITTIRangeImageDataset(self.cfg.Dataset.dir, test_folder_ids,
-                                                                 transform=self.train_transform, train=True, val=use_val,
-                                                                 num_observed_frames=self.cfg.Dataset.num_observed_frames,
-                                                                 num_predict_frames=self.cfg.Dataset.num_predict_frames,
-                                                                 global_min=self.range_image_global_min,
-                                                                 global_max=self.range_image_global_max)
+                    KITTIRangeTrainData = KITTIRangeImageDataset(
+                        self.cfg.Dataset.dir, transform=self.train_transform, train=True, val=use_val,
+                        num_observed_frames=self.cfg.Dataset.num_observed_frames,
+                        num_predict_frames=self.cfg.Dataset.num_predict_frames,
+                        global_min=self.range_image_global_min, global_max=self.range_image_global_max,
+                        train_folder_ids=train_folder_ids if use_explicit else None,
+                        val_folder_ids=val_folder_ids if use_explicit else None,
+                        test_folder_ids=test_folder_ids)
                     if use_val:
                         self.train_set, self.val_set = KITTIRangeTrainData()
                     else:
@@ -255,10 +276,13 @@ class LitDataModule(pl.LightningDataModule):
                     # We'll use a dummy transform for now
                     # Note: Don't pass global_min/global_max here since we're computing them
                     dummy_transform = transforms.Compose([VidToTensor()])
-                    KITTIRangeTrainData_temp = KITTIRangeImageDataset(self.cfg.Dataset.dir, test_folder_ids, 
-                                                                       transform = dummy_transform, train = True, val = use_val,
-                                                                       num_observed_frames= self.cfg.Dataset.num_observed_frames, 
-                                                                       num_predict_frames= self.cfg.Dataset.num_predict_frames)
+                    KITTIRangeTrainData_temp = KITTIRangeImageDataset(
+                        self.cfg.Dataset.dir, transform=dummy_transform, train=True, val=use_val,
+                        num_observed_frames=self.cfg.Dataset.num_observed_frames,
+                        num_predict_frames=self.cfg.Dataset.num_predict_frames,
+                        train_folder_ids=train_folder_ids if use_explicit else None,
+                        val_folder_ids=val_folder_ids if use_explicit else None,
+                        test_folder_ids=test_folder_ids)
                     if use_val:
                         train_set_temp, _ = KITTIRangeTrainData_temp()
                     else:
@@ -290,10 +314,10 @@ class LitDataModule(pl.LightningDataModule):
                         
                         # Save to cache for future use
                         save_global_minmax_to_cache(
-                            self.cfg.Dataset.dir, test_folder_ids,
+                            self.cfg.Dataset.dir, cache_train_ids,
                             self.cfg.Dataset.num_observed_frames,
                             self.cfg.Dataset.num_predict_frames,
-                            use_val,
+                            cache_val_ids,
                             self.range_image_global_min,
                             self.range_image_global_max
                         )
@@ -313,12 +337,14 @@ class LitDataModule(pl.LightningDataModule):
                     ])
                     
                     # Create actual datasets with proper transforms and global min/max
-                    KITTIRangeTrainData = KITTIRangeImageDataset(self.cfg.Dataset.dir, test_folder_ids, 
-                                                                 transform = self.train_transform, train = True, val = use_val,
-                                                             num_observed_frames= self.cfg.Dataset.num_observed_frames, 
-                                                             num_predict_frames= self.cfg.Dataset.num_predict_frames,
-                                                             global_min=self.range_image_global_min, 
-                                                             global_max=self.range_image_global_max)
+                    KITTIRangeTrainData = KITTIRangeImageDataset(
+                        self.cfg.Dataset.dir, transform=self.train_transform, train=True, val=use_val,
+                        num_observed_frames=self.cfg.Dataset.num_observed_frames,
+                        num_predict_frames=self.cfg.Dataset.num_predict_frames,
+                        global_min=self.range_image_global_min, global_max=self.range_image_global_max,
+                        train_folder_ids=train_folder_ids if use_explicit else None,
+                        val_folder_ids=val_folder_ids if use_explicit else None,
+                        test_folder_ids=test_folder_ids)
                     if use_val:
                         self.train_set, self.val_set = KITTIRangeTrainData()
                     else:
@@ -396,10 +422,18 @@ class LitDataModule(pl.LightningDataModule):
                 self.test_set = KITTITrainData()
 
             if self.cfg.Dataset.name == 'KITTI_RANGE':
+                train_folder_ids = self.cfg.Dataset.get("train_folder_ids")
+                val_folder_ids = self.cfg.Dataset.get("val_folder_ids")
                 test_folder_ids = self.cfg.Dataset.get("test_folder_ids", [8, 9, 10])
-                # Convert to integers in case YAML parsed them as strings (e.g., [06, 07, 08, 09])
                 test_folder_ids = [int(i) for i in test_folder_ids]
-                
+                use_explicit = train_folder_ids is not None
+                if use_explicit:
+                    train_folder_ids = [int(i) for i in train_folder_ids]
+                    val_folder_ids = [int(i) for i in (val_folder_ids or [])]
+                use_val = (len(val_folder_ids) > 0) if use_explicit else (self.cfg.Dataset.phase != 'deploy')
+                cache_train_ids = train_folder_ids if use_explicit else sorted(i for i in range(20) if i not in test_folder_ids)
+                cache_val_ids = val_folder_ids if use_explicit else None
+
                 # Initialize transforms if they don't exist (needed when stage="test" only)
                 if not hasattr(self, 'test_transform') or self.test_transform is None:
                     # Transforms need global min/max, so we'll set them up after we get those values
@@ -412,12 +446,11 @@ class LitDataModule(pl.LightningDataModule):
                 
                 if global_min is None or global_max is None:
                     # Try to load from cache first
-                    use_val = self.cfg.Dataset.phase != 'deploy'
                     cached_min, cached_max = load_global_minmax_from_cache(
-                        self.cfg.Dataset.dir, test_folder_ids,
+                        self.cfg.Dataset.dir, cache_train_ids,
                         self.cfg.Dataset.num_observed_frames,
                         self.cfg.Dataset.num_predict_frames,
-                        use_val
+                        cache_val_ids
                     )
                     
                     if cached_min is not None and cached_max is not None:
@@ -430,10 +463,13 @@ class LitDataModule(pl.LightningDataModule):
                         # Cache miss - compute global min/max from training set
                         print("Computing global min/max for test dataset...")
                         dummy_transform = transforms.Compose([VidToTensor()])
-                        KITTIRangeTrainData_temp = KITTIRangeImageDataset(self.cfg.Dataset.dir, test_folder_ids, 
-                                                                           transform = dummy_transform, train = True, val = use_val,
-                                                                           num_observed_frames= self.cfg.Dataset.num_observed_frames, 
-                                                                           num_predict_frames= self.cfg.Dataset.num_predict_frames)
+                        KITTIRangeTrainData_temp = KITTIRangeImageDataset(
+                            self.cfg.Dataset.dir, transform=dummy_transform, train=True, val=use_val,
+                            num_observed_frames=self.cfg.Dataset.num_observed_frames,
+                            num_predict_frames=self.cfg.Dataset.num_predict_frames,
+                            train_folder_ids=train_folder_ids if use_explicit else None,
+                            val_folder_ids=val_folder_ids if use_explicit else None,
+                            test_folder_ids=test_folder_ids)
                         if use_val:
                             train_set_temp, _ = KITTIRangeTrainData_temp()
                         else:
@@ -465,10 +501,10 @@ class LitDataModule(pl.LightningDataModule):
                             
                             # Save to cache for future use
                             save_global_minmax_to_cache(
-                                self.cfg.Dataset.dir, test_folder_ids,
+                                self.cfg.Dataset.dir, cache_train_ids,
                                 self.cfg.Dataset.num_observed_frames,
                                 self.cfg.Dataset.num_predict_frames,
-                                use_val,
+                                cache_val_ids,
                                 global_min,
                                 global_max
                             )
@@ -486,12 +522,12 @@ class LitDataModule(pl.LightningDataModule):
                         self.norm_transform
                     ])
                 
-                KITTIRangeTestData = KITTIRangeImageDataset(self.cfg.Dataset.dir, test_folder_ids,
-                                                            transform = self.test_transform, train = False, val = False,
-                                                            num_observed_frames= self.cfg.Dataset.test_num_observed_frames, 
-                                                            num_predict_frames= self.cfg.Dataset.test_num_predict_frames,
-                                                            global_min=global_min, 
-                                                            global_max=global_max)
+                KITTIRangeTestData = KITTIRangeImageDataset(
+                    self.cfg.Dataset.dir, transform=self.test_transform, train=False, val=False,
+                    num_observed_frames=self.cfg.Dataset.test_num_observed_frames,
+                    num_predict_frames=self.cfg.Dataset.test_num_predict_frames,
+                    global_min=global_min, global_max=global_max,
+                    test_folder_ids=test_folder_ids)
                 self.test_set = KITTIRangeTestData()
 
             if self.cfg.Dataset.name == 'BAIR':
@@ -1441,26 +1477,34 @@ class KITTIRangeImageDataset(object):
     KITTI Range Image dataset, a wrapper for RangeImageClipDataset
     Range images are stored as .npy files in sequence folders
     Structure: KITTI_dir/{sequence_id}/processed/range/*.npy
+
+    Supports two config formats:
+    - Explicit: train_folder_ids, val_folder_ids, test_folder_ids (each list of folder indices)
+    - Legacy: test_folder_ids only -> train = all except test, val = first 2 of train
     """
-    def __init__(self, KITTI_dir, test_folder_ids, transform, train, val,
-                 num_observed_frames, num_predict_frames, global_min=None, global_max=None):
+    def __init__(self, KITTI_dir, transform, train, val,
+                 num_observed_frames, num_predict_frames, global_min=None, global_max=None,
+                 train_folder_ids=None, val_folder_ids=None, test_folder_ids=None):
         """
         Args:
-            KITTI_dir --- Directory for KITTI range images (e.g., /scratch/pydah/kitti/processed_data)
-            test_folder_ids --- List of folder indices to use for testing (e.g., [10, 11, 12, 13])
-            train --- True for training dataset, False for test dataset
-            val --- True if validation split is needed
-            transform --- torchvision transform functions
-            num_observed_frames --- number of past frames
-            num_predict_frames --- number of future frames
-            global_min --- Global minimum value for normalization (if None, uses per-image min)
-            global_max --- Global maximum value for normalization (if None, uses per-image max)
+            KITTI_dir: Directory for KITTI range images
+            transform: torchvision transform functions
+            train: True for training dataset, False for test dataset
+            val: True if validation split is needed (ignored when val_folder_ids provided)
+            num_observed_frames: number of past frames
+            num_predict_frames: number of future frames
+            global_min: Global minimum for normalization
+            global_max: Global maximum for normalization
+            train_folder_ids: List of folder indices for training (explicit mode)
+            val_folder_ids: List of folder indices for validation (explicit mode)
+            test_folder_ids: List of folder indices for testing. In legacy mode, this is the only arg;
+                            train = all except test, val = first 2 of train
         """
         self.num_observed_frames = num_observed_frames
         self.num_predict_frames = num_predict_frames
         self.clip_length = num_observed_frames + num_predict_frames
         self.transform = transform
-        self.color_mode = 'grey_scale'  # Range images are grayscale
+        self.color_mode = 'grey_scale'
         self.global_min = global_min
         self.global_max = global_max
 
@@ -1468,30 +1512,31 @@ class KITTIRangeImageDataset(object):
         self.train = train
         self.val = val
 
-        # Convert test_folder_ids to integers in case they're strings (e.g., from YAML with leading zeros)
-        test_folder_ids = [int(i) for i in test_folder_ids]
-
         # Get all sequence folders (00, 01, 02, etc.)
-        self.all_folders = sorted([f for f in os.listdir(self.KITTI_path) 
+        self.all_folders = sorted([f for f in os.listdir(self.KITTI_path)
                                    if os.path.isdir(self.KITTI_path / f) and f.isdigit()])
         self.num_examples = len(self.all_folders)
-        
-        self.folder_id = list(range(self.num_examples))
-        if self.train:
-            # Get all folders except test folders
+
+        # Resolve folder assignments: explicit (train/val/test) vs legacy (test_folder_ids only)
+        use_explicit = train_folder_ids is not None and test_folder_ids is not None
+        if use_explicit:
+            train_folder_ids = [int(i) for i in train_folder_ids]
+            test_folder_ids = [int(i) for i in test_folder_ids]
+            val_folder_ids = [int(i) for i in (val_folder_ids or [])]
+            self.train_folders = [self.all_folders[i] for i in train_folder_ids if 0 <= i < self.num_examples]
+            self.test_folders = [self.all_folders[i] for i in test_folder_ids if 0 <= i < self.num_examples]
+            self.val_folders = [self.all_folders[i] for i in val_folder_ids if 0 <= i < self.num_examples]
+        else:
+            # Legacy: test_folder_ids only
+            test_folder_ids = [int(i) for i in (test_folder_ids or [8, 9, 10])]
             self.train_folders = [self.all_folders[i] for i in range(self.num_examples) if i not in test_folder_ids]
-            # Only split for validation if val=True AND we have enough sequences
+            self.test_folders = [self.all_folders[i] for i in test_folder_ids]
             if self.val and len(self.train_folders) > 2:
-                # Use first 2 sequences for validation, rest for training
                 self.val_folders = self.train_folders[0:2]
                 self.train_folders = self.train_folders[2:]
-            elif self.val:
-                # If we have 2 or fewer sequences, use all for training, none for validation
+            else:
                 self.val_folders = []
-                # Keep all train_folders for training
-        else:
-            self.test_folders = [self.all_folders[i] for i in test_folder_ids]
-        
+
         if self.train:
             self.train_clips = self.__getClips__(self.train_folders)
             if self.val and len(self.val_folders) > 0:
@@ -1557,7 +1602,7 @@ class KITTIRangeImageDataset(object):
 
 
 def visualize_batch_clips(gt_past_frames_batch, gt_future_frames_batch, pred_frames_batch, file_dir, renorm_transform = None, desc = None,
-                          pred_masks_batch=None, gt_future_masks_batch=None, gt_past_masks_batch=None):
+                          pred_masks_batch=None, gt_future_masks_batch=None, gt_past_masks_batch=None, colormap='turbo_r'):
     """
         pred_frames_batch: tensor with shape (N, future_clip_length, C, H, W)
         gt_future_frames_batch: tensor with shape (N, future_clip_length, C, H, W)
@@ -1565,16 +1610,37 @@ def visualize_batch_clips(gt_past_frames_batch, gt_future_frames_batch, pred_fra
         pred_masks_batch: optional tensor with shape (N, future_clip_length, 1, H, W) - raw mask values
         gt_future_masks_batch: optional tensor with shape (N, future_clip_length, 1, H, W) - binary masks
         gt_past_masks_batch: optional tensor with shape (N, past_clip_length, 1, H, W) - binary masks
+        colormap: str or None. If set (e.g. 'turbo_r'), use matplotlib colormap for color visualization
+                  instead of grayscale. Set to None for original black-and-white behavior.
     """
     if not Path(file_dir).exists():
-        Path(file_dir).mkdir(parents=True, exist_ok=True) 
-    def save_clip(clip, file_name):
+        Path(file_dir).mkdir(parents=True, exist_ok=True)
+    
+    use_cmap = colormap is not None
+    cmap = plt.get_cmap(colormap) if use_cmap else None
+
+    def _to_rgb_with_cmap(arr):
+        """Convert 2D array [0,1] to RGB uint8 using colormap."""
+        arr = np.clip(arr, 0., 1.).astype(np.float32)
+        rgba = cmap(arr)  # (H, W, 4)
+        rgb = (rgba[..., :3] * 255).astype(np.uint8)
+        return Image.fromarray(rgb)
+
+    def save_clip(clip, file_name, already_normalized=False):
         imgs = []
-        if renorm_transform is not None:
+        if not already_normalized and renorm_transform is not None:
             clip = renorm_transform(clip)
             clip = torch.clamp(clip, min = 0., max = 1.0)
         for i in range(clip.shape[0]):
-            img = transforms.ToPILImage()(clip[i, ...])
+            frame = clip[i, ...]  # (C, H, W)
+            if use_cmap and frame.shape[0] == 1:
+                # Grayscale: apply colormap for color visualization
+                arr = frame.squeeze(0).numpy()
+                img = _to_rgb_with_cmap(arr)
+            else:
+                if frame.shape[0] == 1:
+                    frame = frame.repeat(3, 1, 1)  # grayscale to RGB
+                img = transforms.ToPILImage()(frame)
             imgs.append(img)
 
         imgs[0].save(str(Path(file_name).absolute()), save_all = True, append_images = imgs[1:], loop = 0)
@@ -1674,21 +1740,47 @@ def visualize_batch_clips(gt_past_frames_batch, gt_future_frames_batch, pred_fra
                 )  # (T, 3, H, img_width)
                 mask_clip = mask_clip_resized
             
-            # Concatenate vertically: images on top, masks below
-            # image_clip: (T, C, H, W), mask_clip: (T, 3, H, W)
-            # Result: (T, 3, 2H, W) - images on top, masks below
-            if image_clip.shape[1] == 1:
-                # Convert grayscale image to RGB
-                image_clip = image_clip.repeat(1, 3, 1, 1)  # (T, 3, H, W)
+            # Apply renorm before colormap so values are in [0, 1]
+            if renorm_transform is not None:
+                image_clip = renorm_transform(image_clip)
+                image_clip = torch.clamp(image_clip, min=0., max=1.0)
+                mask_clip = renorm_transform(mask_clip)
+                mask_clip = torch.clamp(mask_clip, min=0., max=1.0)
+            
+            # Apply colormap to image and mask if requested
+            if use_cmap:
+                if image_clip.shape[1] == 1:
+                    img_rgb = []
+                    for t in range(image_clip.shape[0]):
+                        arr = image_clip[t, 0].numpy()
+                        img_rgb.append(np.array(_to_rgb_with_cmap(arr)))
+                    image_clip = torch.from_numpy(np.stack(img_rgb)).permute(0, 3, 1, 2)  # (T, 3, H, W)
+                # mask_clip is (T, 3, H, W) from repeat - use channel 0 for 2D values
+                mask_rgb = []
+                for t in range(mask_clip.shape[0]):
+                    arr = mask_clip[t, 0].numpy()
+                    mask_rgb.append(np.array(_to_rgb_with_cmap(arr)))
+                mask_clip = torch.from_numpy(np.stack(mask_rgb)).permute(0, 3, 1, 2)  # (T, 3, H, W)
+            elif image_clip.shape[1] == 1:
+                image_clip = image_clip.repeat(1, 3, 1, 1)
             
             # Concatenate along height dimension (dim=-2): images on top, masks below
             combined_clip = torch.cat([image_clip, mask_clip], dim = -2)  # (T, 3, 2H, W)
+            save_clip(combined_clip, file_dir.joinpath(f'{desc}_clip_{n}.gif' if desc else f'clip_{n}.gif'), already_normalized=use_cmap)
         else:
             # No masks, just use images
             combined_clip = image_batch[n, ...]
-            if combined_clip.shape[1] == 1:
-                # Convert grayscale to RGB
-                combined_clip = combined_clip.repeat(1, 3, 1, 1)
-        
-        file_name = file_dir.joinpath(f'{desc}_clip_{n}.gif' if desc else f'clip_{n}.gif')
-        save_clip(combined_clip, file_name)
+            if use_cmap and combined_clip.shape[1] == 1:
+                if renorm_transform is not None:
+                    combined_clip = renorm_transform(combined_clip)
+                    combined_clip = torch.clamp(combined_clip, min=0., max=1.0)
+                img_rgb = []
+                for t in range(combined_clip.shape[0]):
+                    arr = combined_clip[t, 0].numpy()
+                    img_rgb.append(np.array(_to_rgb_with_cmap(arr)))
+                combined_clip = torch.from_numpy(np.stack(img_rgb)).permute(0, 3, 1, 2)
+                save_clip(combined_clip, file_dir.joinpath(f'{desc}_clip_{n}.gif' if desc else f'clip_{n}.gif'), already_normalized=True)
+            else:
+                if combined_clip.shape[1] == 1:
+                    combined_clip = combined_clip.repeat(1, 3, 1, 1)
+                save_clip(combined_clip, file_dir.joinpath(f'{desc}_clip_{n}.gif' if desc else f'clip_{n}.gif'))
