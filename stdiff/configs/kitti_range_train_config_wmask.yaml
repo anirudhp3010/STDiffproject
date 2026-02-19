@@ -3,7 +3,7 @@ Env:
     # Use kitti_range_test_config_wmask.yaml for inference
     output_dir: '/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask_flow_matching'
     logger: 'tensorboard'
-    resume_ckpt: "checkpoint-19200" # Set to checkpoint path if resuming
+    resume_ckpt: "checkpoint-20550" # Set to checkpoint path if resuming
     stdiff_init_ckpt: null
     
 

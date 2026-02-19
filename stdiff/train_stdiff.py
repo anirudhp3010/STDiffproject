@@ -422,8 +422,7 @@ def main(cfg : DictConfig) -> None:
                 mask_weight = cfg.Training.get('mask_loss_weight', 1.0)
                 if mask_loss is not None:
                     loss = image_loss + mask_weight * mask_loss
-                else:
-                    loss = image_loss
+                
 
                 # Projection loss (modular REPA)
                 proj_loss = None
