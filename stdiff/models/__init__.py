@@ -1,4 +1,5 @@
 from .stdiff_diffusers import STDiffDiffusers
+from .projector import REPAProjector, build_mlp
 from .diff_unet import create_diff_model
 from .stdiff_pipeline import STDiffPipeline
 from .flow_matching import FlowMatchingNoiseAdder, add_flow_noise, get_velocity_target

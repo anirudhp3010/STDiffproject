@@ -134,8 +134,9 @@ def main(cfg : DictConfig) -> None:
         if cfg.Env.output_dir is not None:
             os.makedirs(cfg.Env.output_dir, exist_ok=True)
 
-    # Initialize the model
-    model = STDiffDiffusers(cfg.STDiff.Diffusion.unet_config, cfg.STDiff.DiffNet)
+    # Initialize the model (with optional REPA config)
+    repa_config = cfg.STDiff.get("repa_config")
+    model = STDiffDiffusers(cfg.STDiff.Diffusion.unet_config, cfg.STDiff.DiffNet, repa_config=repa_config)
     num_p_model = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f'num params of stdiff: {num_p_model/1e6} M')
 
@@ -272,15 +273,23 @@ def main(cfg : DictConfig) -> None:
         progress_bar.set_description(f"Epoch {epoch}")
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
-                # Handle both regular datasets and range image datasets (with masks)
-                if len(batch) == 8:  # Range images with masks
+                # Handle batch format: 5 (no masks), 8 (with masks), 9 (with masks + features)
+                if len(batch) == 9:
+                    Vo, Vp, Vo_last_frame, idx_o, idx_p, Vo_mask, Vp_mask, Vo_last_mask, scalr_features = batch
+                    has_masks = True
+                    has_features = True
+                elif len(batch) == 8:
                     Vo, Vp, Vo_last_frame, idx_o, idx_p, Vo_mask, Vp_mask, Vo_last_mask = batch
                     has_masks = True
-                else:  # Regular datasets without masks
+                    has_features = False
+                    scalr_features = None
+                else:
                     Vo, Vp, Vo_last_frame, idx_o, idx_p = batch
                     has_masks = False
+                    has_features = False
                     Vo_mask = None
                     Vp_mask = None
+                    scalr_features = None
             
                 clean_images = Vp.flatten(0, 1)
                 # Flatten masks if they exist
@@ -307,7 +316,7 @@ def main(cfg : DictConfig) -> None:
                     N, Tp, C, H, W = Vp.shape
                     noise = (
                         torch.randn(N, C, H, W).unsqueeze(1).repeat(1, Tp, 1, 1, 1).flatten(0, 1).to(clean_images.device)
-                        + 0.1 * torch.randn(N * Tp, C, 1, 1, device=clean_images.device)
+                        + 0.15 * torch.randn(N * Tp, C, 1, 1, device=clean_images.device)
                     )
                     Vo_last_frame = None
 
@@ -315,7 +324,7 @@ def main(cfg : DictConfig) -> None:
                     bsz, C, H, W = clean_images.shape
                     noise = (
                         torch.randn(clean_images.shape).to(clean_images.device)
-                        + 0.1 * torch.randn(bsz, C, 1, 1, device=clean_images.device)
+                        + 0.15 * torch.randn(bsz, C, 1, 1, device=clean_images.device)
                     )
                 bsz = clean_images.shape[0]
                 # Sample timestep(s): discrete for DDPM, continuous for flow matching
@@ -358,10 +367,11 @@ def main(cfg : DictConfig) -> None:
                     else:
                         noisy_images = torch.cat([noisy_images, Vo_expanded.clamp(-1, 1)], dim=1)  # (N*Tp, C+To*C, H, W) = (N*Tp, 4, H, W)
                 
-                # Predict the noise residual
+                # Predict the noise residual (optionally return projection for REPA loss)
+                use_projection_loss = cfg.Training.get('use_projection_loss', False) and has_features and scalr_features is not None
                 model_output = model(Vo, idx_o, idx_p, noisy_images, timesteps, Vp, Vo_last_frame, 
                                      noisy_mask=noisy_mask, clean_mask=valid_mask_norm.unsqueeze(1) if predict_mask else None,
-                                     predict_mask=predict_mask)
+                                     predict_mask=predict_mask, return_projection=use_projection_loss)
 
                 # Use image channel only for image loss (channel 0 when predict_mask, else full sample)
                 image_output_for_loss = model_output.sample[:, 0:1, ...] if predict_mask else model_output.sample
@@ -382,8 +392,15 @@ def main(cfg : DictConfig) -> None:
                 else:
                     raise ValueError(f"Unsupported prediction type: {cfg.STDiff.Diffusion.prediction_type}")
                 
-                # Compute image loss
-                image_loss = loss_per_pixel.mean()
+                # Compute image loss: apply L1 only on valid pixels when GT mask is available
+                if has_masks and valid_mask is not None:
+                    # valid_mask: (N*Tp, H, W), valid=1 invalid=0
+                    valid_mask_expanded = valid_mask.unsqueeze(1)  # (N*Tp, 1, H, W)
+                    masked_loss = loss_per_pixel * valid_mask_expanded
+                    num_valid = valid_mask_expanded.sum().clamp(min=1)
+                    image_loss = masked_loss.sum() / num_valid
+                else:
+                    image_loss = loss_per_pixel.mean()
                 
                 # Compute mask loss if predict_mask is enabled
                 mask_loss = None
@@ -407,6 +424,17 @@ def main(cfg : DictConfig) -> None:
                     loss = image_loss + mask_weight * mask_loss
                 else:
                     loss = image_loss
+
+                # Projection loss (modular REPA)
+                proj_loss = None
+                if use_projection_loss and hasattr(model_output, 'projection_output') and model_output.projection_output is not None:
+                    from stdiff.losses import compute_projection_loss
+                    # scalr_features: (N, Tp, N_grid, C), flatten to (N*Tp, N_grid, C)
+                    zs = [scalr_features.flatten(0, 1).to(clean_images.device)]  # (N*Tp, N_grid, C)
+                    zs_tilde = model_output.projection_output  # List of (N*Tp, N_grid, z_dim)
+                    proj_loss = compute_projection_loss(zs, zs_tilde)
+                    proj_coeff = cfg.Training.get('proj_coeff', 0.1)
+                    loss = loss + proj_coeff * proj_loss
                 
                 # Check for NaN or Inf loss
                 if torch.isnan(loss) or torch.isinf(loss):
@@ -474,6 +502,8 @@ def main(cfg : DictConfig) -> None:
                                         logger.warning(f"Failed to delete checkpoint {old_checkpoint}: {e}")
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
+            if proj_loss is not None:
+                logs["proj_loss"] = round(proj_loss.detach().item(), 4)
             if cfg.Training.get('predict_mask', False):
                 if mask_loss is not None:
                     logs["mask_loss"] = round(mask_loss.detach().item(), 4)

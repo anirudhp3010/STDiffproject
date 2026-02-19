@@ -4,10 +4,11 @@ import torchvision.transforms as transforms
 from diffusers import ConfigMixin, ModelMixin, register_to_config, UNet2DMotionCond
 from .diff_unet import DiffModel
 from omegaconf import OmegaConf
+from typing import Optional, Tuple
 
 class STDiffDiffusers(ModelMixin, ConfigMixin):
     @register_to_config
-    def __init__(self, unet_cfg, tde_cfg):
+    def __init__(self, unet_cfg, tde_cfg, repa_config: Optional[dict] = None):
         super().__init__()
         try:
             self.autoreg = tde_cfg.autoregressive
@@ -20,8 +21,20 @@ class STDiffDiffusers(ModelMixin, ConfigMixin):
             self.tde_model = DiffModel(tde_cfg.Int, tde_cfg.MotionEncoder, tde_cfg.DiffUnet)
         self.diffusion_unet = UNet2DMotionCond(**unet_cfg)
 
+        # Optional REPA projector (modular)
+        self.repa_projector = None
+        if repa_config is not None and repa_config.get("enabled", False):
+            from .projector import REPAProjector
+            self.repa_projector = REPAProjector(
+                hidden_channels=unet_cfg["block_out_channels"][-1],
+                z_dim=repa_config.get("z_dim", 768),
+                projector_dim=repa_config.get("projector_dim", 2048),
+                target_grid=tuple(repa_config["target_grid"]) if repa_config.get("target_grid") else None,
+                scale_mode=repa_config.get("scale_mode", "bicubic"),
+            )
+
     def forward(self, Vo, idx_o, idx_p, noisy_Vp, timestep, clean_Vp = None, Vo_last_frame=None, 
-                noisy_mask=None, clean_mask=None, predict_mask=False):
+                noisy_mask=None, clean_mask=None, predict_mask=False, return_projection=False):
         #vo: (N, To, C, Ho, Wo), idx_o: (To, ), idx_p: (Tp, ), noisy_Vp: (N*Tp, C, Hp, Wp)
         m_context = self.tde_model.context_encode(Vo, idx_o) #(N, C, H, W)
             
@@ -63,8 +76,23 @@ class STDiffDiffusers(ModelMixin, ConfigMixin):
                 if noisy_Vp.shape[1] < expected_channels_with_mask:
                     noisy_Vp = torch.cat([noisy_Vp, noisy_mask], dim=1)
 
+        # Run UNet; optionally capture bottleneck for REPA projection
+        bottleneck_out = [None]
+        if return_projection and self.repa_projector is not None:
+            def _capture_bottleneck(module, _in, out):
+                bottleneck_out[0] = out  # Keep grad for projection loss to flow through UNet
+            handle = self.diffusion_unet.mid_block.register_forward_hook(_capture_bottleneck)
+
         out = self.diffusion_unet(noisy_Vp, timestep, m_feat = m_future.permute(1, 0, 2, 3, 4).flatten(0, 1))
-        
+
+        if return_projection and self.repa_projector is not None:
+            handle.remove()
+            if bottleneck_out[0] is not None:
+                zs_tilde = [self.repa_projector(bottleneck_out[0])]  # List for multi-encoder compatibility
+                out.projection_output = zs_tilde
+            else:
+                out.projection_output = None
+
         # Split output if predict_mask: out_channels should be 2 (1 image + 1 mask)
         # Keep full out.sample (2 channels) so training can extract both; set image_sample/mask_sample for pipeline
         if predict_mask:

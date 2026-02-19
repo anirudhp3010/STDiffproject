@@ -214,6 +214,15 @@ class LitDataModule(pl.LightningDataModule):
                 self.train_set, self.val_set = KITTITrainData()
 
             if self.cfg.Dataset.name == 'KITTI_RANGE':
+                # Optional ScaLR feature loader for projection loss (modular)
+                scalr_loader = None
+                scalr_dir = self.cfg.Dataset.get("scalr_features_dir")
+                if scalr_dir:
+                    from stdiff.utils.scalr_features import ScaLRFeatureLoader
+                    grid_size = tuple(self.cfg.Dataset.get("scalr_grid_size", [8, 64]))
+                    scalr_root = scalr_dir if Path(scalr_dir).is_absolute() else Path(self.cfg.Dataset.dir) / scalr_dir
+                    scalr_loader = ScaLRFeatureLoader(str(scalr_root), grid_size=grid_size, subdir="")
+
                 # Get folder IDs: explicit (train/val/test) or legacy (test_folder_ids only)
                 train_folder_ids = self.cfg.Dataset.get("train_folder_ids")
                 val_folder_ids = self.cfg.Dataset.get("val_folder_ids")
@@ -344,7 +353,7 @@ class LitDataModule(pl.LightningDataModule):
                         global_min=self.range_image_global_min, global_max=self.range_image_global_max,
                         train_folder_ids=train_folder_ids if use_explicit else None,
                         val_folder_ids=val_folder_ids if use_explicit else None,
-                        test_folder_ids=test_folder_ids)
+                        test_folder_ids=test_folder_ids, scalr_loader=scalr_loader)
                     if use_val:
                         self.train_set, self.val_set = KITTIRangeTrainData()
                     else:
@@ -422,6 +431,15 @@ class LitDataModule(pl.LightningDataModule):
                 self.test_set = KITTITrainData()
 
             if self.cfg.Dataset.name == 'KITTI_RANGE':
+                # ScaLR loader for test (also used when stage=test only)
+                scalr_loader_test = None
+                if self.cfg.Dataset.get("scalr_features_dir"):
+                    from stdiff.utils.scalr_features import ScaLRFeatureLoader
+                    grid_size = tuple(self.cfg.Dataset.get("scalr_grid_size", [8, 64]))
+                    scalr_dir = self.cfg.Dataset.get("scalr_features_dir")
+                    scalr_root = scalr_dir if Path(scalr_dir).is_absolute() else Path(self.cfg.Dataset.dir) / scalr_dir
+                    scalr_loader_test = ScaLRFeatureLoader(str(scalr_root), grid_size=grid_size, subdir="")
+
                 train_folder_ids = self.cfg.Dataset.get("train_folder_ids")
                 val_folder_ids = self.cfg.Dataset.get("val_folder_ids")
                 test_folder_ids = self.cfg.Dataset.get("test_folder_ids", [8, 9, 10])
@@ -527,7 +545,7 @@ class LitDataModule(pl.LightningDataModule):
                     num_observed_frames=self.cfg.Dataset.test_num_observed_frames,
                     num_predict_frames=self.cfg.Dataset.test_num_predict_frames,
                     global_min=global_min, global_max=global_max,
-                    test_folder_ids=test_folder_ids)
+                    test_folder_ids=test_folder_ids, scalr_loader=scalr_loader_test)
                 self.test_set = KITTIRangeTestData()
 
             if self.cfg.Dataset.name == 'BAIR':
@@ -1006,20 +1024,34 @@ def svrfcn(batch_data, rand_Tp = 3, rand_predict = True, o_resize = None, p_resi
     """
     Single video dataset random future frames collate function
     batch_data: list of tuples, each tuple is (observe_clip, predict_clip) or 
-                (observe_clip, predict_clip, observe_mask, predict_mask) for range images
+                (observe_clip, predict_clip, observe_mask, predict_mask) for range images, or
+                (observe_clip, predict_clip, observe_mask, predict_mask, features) when ScaLR features loaded
     """
-    
-    # Check if masks are provided (for range images)
-    has_masks = len(batch_data[0]) == 4
-    
-    if has_masks:
+    # Check format: 5 = with features, 4 = masks only, 2 = no masks
+    has_features = len(batch_data[0]) == 5
+    has_masks = len(batch_data[0]) >= 4
+
+    if has_features:
+        observe_clips, predict_clips, observe_masks, predict_masks, features_list = zip(*batch_data)
+        if all(f is not None for f in features_list):
+            features_batch = torch.stack(features_list, dim=0)
+        else:
+            features_batch = None
+    elif has_masks:
         observe_clips, predict_clips, observe_masks, predict_masks = zip(*batch_data)
-        observe_batch = torch.stack(observe_clips, dim=0)
-        predict_batch = torch.stack(predict_clips, dim=0)
-        observe_mask_batch = torch.stack(observe_masks, dim=0)  # (N, To, H, W)
-        predict_mask_batch = torch.stack(predict_masks, dim=0)  # (N, Tp, H, W)
+        features_batch = None
     else:
         observe_clips, predict_clips = zip(*batch_data)
+        observe_mask_batch = None
+        predict_mask_batch = None
+        features_batch = None
+
+    if has_masks or has_features:
+        observe_batch = torch.stack(observe_clips, dim=0)
+        predict_batch = torch.stack(predict_clips, dim=0)
+        observe_mask_batch = torch.stack(observe_masks, dim=0) if has_masks else None
+        predict_mask_batch = torch.stack(predict_masks, dim=0) if has_masks else None
+    else:
         observe_batch = torch.stack(observe_clips, dim=0)
         predict_batch = torch.stack(predict_clips, dim=0)
         observe_mask_batch = None
@@ -1039,6 +1071,8 @@ def svrfcn(batch_data, rand_Tp = 3, rand_predict = True, o_resize = None, p_resi
             rand_predict_mask_batch = predict_mask_batch[:, rand_idx.long(), ...]  # (N, rand_Tp, H, W)
         else:
             rand_predict_mask_batch = None
+        if features_batch is not None:
+            features_batch = features_batch[:, rand_idx.long(), ...]  # (N, rand_Tp, N_grid, C)
     else:
         rand_idx = torch.linspace(0, max_Tp-1, max_Tp, dtype = torch.int)
         rand_predict_batch = predict_batch
@@ -1046,6 +1080,7 @@ def svrfcn(batch_data, rand_Tp = 3, rand_predict = True, o_resize = None, p_resi
             rand_predict_mask_batch = predict_mask_batch
         else:
             rand_predict_mask_batch = None
+        # features_batch unchanged when not rand_predict
     
     To = observe_batch.shape[1]
     idx_o = torch.linspace(0, To-1 , To, dtype = torch.int)
@@ -1068,6 +1103,8 @@ def svrfcn(batch_data, rand_Tp = 3, rand_predict = True, o_resize = None, p_resi
         observe_last_batch = observe_batch[:, -1:, ...]
         if has_masks:
             rand_predict_mask_batch = rand_predict_mask_batch[:, ::2, ...]
+        if features_batch is not None:
+            features_batch = features_batch[:, ::2, ...]
 
     if p_resize is not None:
         N, T, _, _, _ = rand_predict_batch.shape
@@ -1107,10 +1144,13 @@ def svrfcn(batch_data, rand_Tp = 3, rand_predict = True, o_resize = None, p_resi
             ).squeeze(1).bool()
             observe_mask_batch = rearrange(observe_mask_batch, "(N T) H W -> N T H W", N = N_mask, T=T_mask)
     
-    # Return with or without masks
-    if has_masks:
-        return (observe_batch, rand_predict_batch, observe_last_batch, idx_o.to(torch.float), rand_idx.to(torch.float) + To, 
-                observe_mask_batch, rand_predict_mask_batch, observe_last_mask_batch)
+    # Return with or without masks and optional features
+    if has_masks or has_features:
+        out = (observe_batch, rand_predict_batch, observe_last_batch, idx_o.to(torch.float), rand_idx.to(torch.float) + To, 
+               observe_mask_batch, rand_predict_mask_batch, observe_last_mask_batch)
+        if features_batch is not None:
+            out = out + (features_batch,)
+        return out
     else:
         return (observe_batch, rand_predict_batch, observe_last_batch, idx_o.to(torch.float), rand_idx.to(torch.float) + To)
 
@@ -1364,9 +1404,10 @@ def get_data_inverse_scaler(config):
 
 class RangeImageClipDataset(Dataset):
     """
-    Video clips dataset for range images stored as .npy files
+    Video clips dataset for range images stored as .npy files.
+    Optionally loads ScaLR features when scalr_loader is provided.
     """
-    def __init__(self, num_observed_frames, num_predict_frames, clips, transform, color_mode, global_min=None, global_max=None):
+    def __init__(self, num_observed_frames, num_predict_frames, clips, transform, color_mode, global_min=None, global_max=None, scalr_loader=None):
         """
         Args:
             num_observed_frames --- number of past frames
@@ -1376,10 +1417,10 @@ class RangeImageClipDataset(Dataset):
             color_mode --- 'grey_scale' for range images (single channel)
             global_min --- Global minimum value for normalization (if None, uses per-image min)
             global_max --- Global maximum value for normalization (if None, uses per-image max)
+            scalr_loader --- Optional ScaLRFeatureLoader for projection loss. When set, __getitem__ returns features for future frames.
 
         Return batched Sample:
-            past_clip --- Tensor with shape (batch_size, num_observed_frames, C, H, W)
-            future_clip --- Tensor with shape (batch_size, num_predict_frames, C, H, W)
+            past_clip, future_clip, past_mask, future_mask [, features]
         """
         self.num_observed_frames = num_observed_frames
         self.num_predict_frames = num_predict_frames
@@ -1390,6 +1431,7 @@ class RangeImageClipDataset(Dataset):
         self.color_mode = color_mode
         self.global_min = global_min
         self.global_max = global_max
+        self.scalr_loader = scalr_loader
 
     def __len__(self):
         return len(self.clips)
@@ -1468,7 +1510,14 @@ class RangeImageClipDataset(Dataset):
         future_clip = original_clip[-self.num_predict_frames:, ...]
         past_valid_mask = valid_masks_tensor[0:self.num_observed_frames, ...]  # (To, H, W)
         future_valid_mask = valid_masks_tensor[-self.num_predict_frames:, ...]  # (Tp, H, W)
-        
+
+        if self.scalr_loader is not None:
+            from stdiff.utils.scalr_features import load_scalr_features_for_clip
+            future_clip_files = clip_files[-self.num_predict_frames:]
+            features = load_scalr_features_for_clip(self.scalr_loader, future_clip_files)
+            # Always return 5 elements when scalr_loader set (features may be None if load failed)
+            return past_clip, future_clip, past_valid_mask, future_valid_mask, features
+
         return past_clip, future_clip, past_valid_mask, future_valid_mask
 
 
@@ -1484,7 +1533,8 @@ class KITTIRangeImageDataset(object):
     """
     def __init__(self, KITTI_dir, transform, train, val,
                  num_observed_frames, num_predict_frames, global_min=None, global_max=None,
-                 train_folder_ids=None, val_folder_ids=None, test_folder_ids=None):
+                 train_folder_ids=None, val_folder_ids=None, test_folder_ids=None,
+                 scalr_loader=None):
         """
         Args:
             KITTI_dir: Directory for KITTI range images
@@ -1499,6 +1549,7 @@ class KITTIRangeImageDataset(object):
             val_folder_ids: List of folder indices for validation (explicit mode)
             test_folder_ids: List of folder indices for testing. In legacy mode, this is the only arg;
                             train = all except test, val = first 2 of train
+            scalr_loader: Optional ScaLRFeatureLoader for projection loss (modular)
         """
         self.num_observed_frames = num_observed_frames
         self.num_predict_frames = num_predict_frames
@@ -1507,6 +1558,7 @@ class KITTIRangeImageDataset(object):
         self.color_mode = 'grey_scale'
         self.global_min = global_min
         self.global_max = global_max
+        self.scalr_loader = scalr_loader
 
         self.KITTI_path = Path(KITTI_dir).absolute()
         self.train = train
@@ -1554,17 +1606,20 @@ class KITTIRangeImageDataset(object):
         if self.train:
             clip_set = RangeImageClipDataset(self.num_observed_frames, self.num_predict_frames, 
                                             self.train_clips, self.transform, self.color_mode,
-                                            global_min=self.global_min, global_max=self.global_max)
+                                            global_min=self.global_min, global_max=self.global_max,
+                                            scalr_loader=self.scalr_loader)
             if self.val and len(self.val_clips) > 0:
                 val_clip_set = RangeImageClipDataset(self.num_observed_frames, self.num_predict_frames, 
                                                     self.val_clips, self.transform, self.color_mode,
-                                                    global_min=self.global_min, global_max=self.global_max)
+                                                    global_min=self.global_min, global_max=self.global_max,
+                                                    scalr_loader=self.scalr_loader)
                 return clip_set, val_clip_set
             return clip_set
         else:
             return RangeImageClipDataset(self.num_observed_frames, self.num_predict_frames, 
                                         self.test_clips, self.transform, self.color_mode,
-                                        global_min=self.global_min, global_max=self.global_max)
+                                        global_min=self.global_min, global_max=self.global_max,
+                                        scalr_loader=self.scalr_loader)
     
     def __getClips__(self, frame_folders):
         """

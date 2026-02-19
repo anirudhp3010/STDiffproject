@@ -3,13 +3,13 @@ Env:
     # Use kitti_range_test_config_wmask.yaml for inference
     output_dir: '/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask_flow_matching'
     logger: 'tensorboard'
-    resume_ckpt: null # Set to checkpoint path if resuming
+    resume_ckpt: "checkpoint-19200" # Set to checkpoint path if resuming
     stdiff_init_ckpt: null
     
 
 Dataset:
     name: 'KITTI_RANGE'
-    dir: '/DATA/common/kitti/processed_data_64x512'
+    dir: '/DATA2/common/kitti/processed_data_64x512'
     phase: 'deploy'
     dev_set_size: null
     batch_size: 6 # Reduced for range images
