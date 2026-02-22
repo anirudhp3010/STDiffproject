@@ -1,0 +1,113 @@
+# KITTI Range training WITH REPA projection loss (ScaLR alignment)
+# Extends kitti_range_train_config_wmask.yaml
+# Requires: 1) ScaLR features precomputed, 2) scalr_features_dir in Dataset
+# Use R3DPA's preprocess_scalr_features_semantickitti.py to extract features
+
+Env:
+    output_dir: '/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask_flow_matching_repa'
+    logger: 'tensorboard'
+    resume_ckpt: null
+    stdiff_init_ckpt: null
+
+Dataset:
+    name: 'KITTI_RANGE'
+    dir: '/DATA2/common/kitti/processed_data_64x512'
+    phase: 'deploy'
+    dev_set_size: null
+    batch_size: 6
+    num_workers: 12
+    num_channels: 1
+    image_size: [64, 512]
+    num_observed_frames: 3
+    num_predict_frames: 3
+    test_num_observed_frames: 3
+    test_num_predict_frames: 3
+    rand_Tp: 3
+    rand_predict: True
+    half_fps: False
+    train_folder_ids: [0,1,2,3,4,5,6,7,8]
+    val_folder_ids: []
+    test_folder_ids: [9]
+    # ScaLR features (modular): path relative to Dataset.dir or absolute
+    scalr_features_dir: 'scalr_features'
+    scalr_grid_size: [8, 64]
+
+STDiff:
+    Diffusion:
+        prediction_type: 'v'
+        flow_path_type: 'cosine'
+        ddpm_num_steps: 1000
+        ddpm_num_inference_steps: 50
+        ddpm_beta_schedule: "squaredcos_cap_v2"
+        unet_config:
+            sample_size: [64, 512]
+            in_channels: 5
+            out_channels: 2
+            m_channels: 256
+            layers_per_block: 2
+            block_out_channels: [128, 256, 256, 512, 512]
+            down_block_types: ["DownBlock2D","AttnDownBlock2D","AttnDownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D"]
+            up_block_types: ["AttnUpBlock2D", "AttnUpBlock2D","AttnUpBlock2D", "AttnUpBlock2D", "UpBlock2D"]
+            attention_head_dim: [null, 128, 128, 128, 128]
+
+    # REPA projector config (modular)
+    repa_config:
+        enabled: True
+        z_dim: 768          # ScaLR feature dim
+        projector_dim: 2048
+        target_grid: [8, 64]  # Match ScaLR grid
+        scale_mode: 'bicubic'
+
+    DiffNet:
+        autoregressive: False
+        super_res_training: False
+        MotionEncoder:
+            learn_diff_image: True
+            image_size: [64, 512]
+            in_channels: 1
+            model_channels: 64
+            n_downs: 2
+        DiffUnet:
+            n_layers: 2
+            nonlinear: 'tanh'
+        Int:
+            sde: True
+            method: 'euler_heun'
+            sde_options:
+                noise_type: 'diagonal'
+                sde_type: "stratonovich"
+                dt: 0.1
+                rtol: 1e-3
+                atol: 1e-3
+                adaptive: False
+            ode_options:
+                step_size: 0.1
+                norm: null
+
+Training:
+    use_ema: True
+    ema_inv_gamma: 1.0
+    ema_power: 0.75
+    ema_max_decay: 0.9999
+    learning_rate: 1e-4
+    lr_scheduler: 'cosine_with_restarts'
+    lr_warmup_steps: 500
+    num_cycles: 2
+    adam_betas: [0.9, 0.999]
+    adam_weight_decay: 1e-6
+    adam_epsilon: 1e-8
+    max_grad_norm: 5.0
+    epochs: 400
+    save_images_epochs: 4
+    save_model_epochs: 2
+    checkpointing_steps: 150
+    max_checkpoints_to_keep: 3
+    gradient_accumulation_steps: 3
+    mixed_precision: "bf16"
+    gradient_checkpointing: True
+    use_xformers: True
+    predict_mask: True
+    mask_loss_weight: 0.2
+    # REPA projection loss (modular)
+    use_projection_loss: True
+    proj_coeff: 0.1

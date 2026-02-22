@@ -1,0 +1,86 @@
+Dataset:
+    name: 'KITTI_RANGE'
+    dir: '/DATA2/common/kitti/processed_data_64x512'  # Must match training (64x512); processed_data is 64x2048
+    phase: 'deploy'
+    dev_set_size: null
+    batch_size: 1  # Reduced for range images
+    num_workers: 3
+    num_channels: 1  # Grayscale range images
+    image_size: [64, 512]  # Range images: 64 height x 512 width
+    num_observed_frames: 3
+    num_predict_frames: 3
+    test_num_observed_frames: 3
+    test_num_predict_frames: 3
+    rand_Tp: 3
+    rand_predict: True
+    half_fps: False
+    train_folder_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+    val_folder_ids: [8]
+    test_folder_ids: [9]  # Folder indices for testing
+
+STDiff:
+    Diffusion:
+        prediction_type: 'epsilon'
+        ddpm_num_steps: 1000
+        ddpm_num_inference_steps: 50
+        ddpm_beta_schedule: "squaredcos_cap_v2"
+
+        unet_config:
+            # WITH MASK: match trained model (predict_mask=True)
+            # in_channels = out_channels (2: image+mask) + To*C (3*1) = 5
+            sample_size: [64, 512]
+            in_channels: 5
+            out_channels: 2  # 1 image + 1 mask
+            m_channels: 256
+            layers_per_block: 2
+            block_out_channels: [128, 256, 256, 512, 512]
+            down_block_types: ["DownBlock2D","AttnDownBlock2D","AttnDownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D"]
+            up_block_types: ["AttnUpBlock2D", "AttnUpBlock2D","AttnUpBlock2D", "AttnUpBlock2D", "UpBlock2D"]
+            attention_head_dim: [null, 128, 128, 128, 128]
+
+    DiffNet:
+        autoregressive: False  # Must match trained non-autoregressive checkpoint
+        super_res_training: False
+        MotionEncoder:
+            learn_diff_image: True
+            image_size: [64, 512]
+            in_channels: 1  # Grayscale input
+            model_channels: 64
+            n_downs: 2
+        DiffUnet:
+            n_layers: 2
+            nonlinear: 'tanh'
+        Int:
+            sde: True
+            method: 'euler_heun'
+            sde_options:
+                noise_type: 'diagonal'
+                sde_type: "stratonovich"
+                dt: 0.1
+                rtol: 1e-3
+                atol: 1e-3
+                adaptive: False
+            ode_options:
+                step_size: 0.1
+                norm: null
+
+TestCfg:
+    # Point to mask checkpoint (trained with kitti_range_train_config_wmask.yaml)
+    ckpt_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask/checkpoint-27000"
+    test_results_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask/test_results_wmask_27000_DDPM_50steps"
+    gradient_checkpointing: False
+    use_xformers: False
+    scheduler:
+        name: 'DDPM'
+        sample_steps: 50
+        ema: False
+
+    fps: 1
+    metrics: ['PSNR', 'SSIM', 'LPIPS', 'InterLPIPS']
+    random_predict:
+        first_pred_sample_num: 1
+        first_pred_parralle_bs: 1
+        sample_num: 1
+        fix_init_noise: False
+
+    predict_mask: True  # Enable mask prediction (uses g_Preds_mask, saves binary {1,-1})
