@@ -36,6 +36,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from utils import get_lightning_module_dataloader
 from models import STDiffDiffusers, STDiffPipeline, FlowMatchingNoiseAdder, EulerFlowScheduler
+from models.flow_matching import recover_x0_from_velocity
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.15.0.dev0")
@@ -210,7 +211,7 @@ def main(cfg : DictConfig) -> None:
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
 
     # Preprocessing the datasets and DataLoaders creation.
-    train_dataloader, val_dataloader, test_dataloader, _ = get_lightning_module_dataloader(cfg, stage="fit")
+    train_dataloader, val_dataloader, test_dataloader, pl_datamodule = get_lightning_module_dataloader(cfg, stage="fit")
 
     # Initialize the learning rate scheduler
     lr_scheduler = get_scheduler(
@@ -345,7 +346,11 @@ def main(cfg : DictConfig) -> None:
                     mask_noise = torch.randn(valid_mask_norm.shape).to(valid_mask_norm.device)
                     noisy_mask = noise_scheduler.add_noise(valid_mask_norm, mask_noise, timesteps)
                     noisy_mask = noisy_mask.unsqueeze(1)  # (N*Tp, H, W) -> (N*Tp, 1, H, W)
-                
+
+                # Store noisy image for normal loss (single-step x0 recovery) before concat
+                use_normal_loss = cfg.Training.get('use_normal_loss', False) and use_flow_matching and has_masks
+                x_t_image = noisy_images[:, 0:1].clone() if use_normal_loss else None
+
                 # For non-autoregressive mode, we need to concatenate Vo frames with noisy_images
                 # This matches what the pipeline does during inference
                 if not cfg.STDiff.DiffNet.autoregressive:
@@ -392,18 +397,12 @@ def main(cfg : DictConfig) -> None:
                 else:
                     raise ValueError(f"Unsupported prediction type: {cfg.STDiff.Diffusion.prediction_type}")
                 
-                # Compute image loss: apply L1 only on valid pixels when GT mask is available
-                if has_masks and valid_mask is not None:
-                    # valid_mask: (N*Tp, H, W), valid=1 invalid=0
-                    valid_mask_expanded = valid_mask.unsqueeze(1)  # (N*Tp, 1, H, W)
-                    masked_loss = loss_per_pixel * valid_mask_expanded
-                    num_valid = valid_mask_expanded.sum().clamp(min=1)
-                    image_loss = masked_loss.sum() / num_valid
-                else:
-                    image_loss = loss_per_pixel.mean()
+                # Compute image loss: L1 over all pixels (no valid-pixel masking)
+                image_loss = loss_per_pixel.mean()
                 
                 # Compute mask loss if predict_mask is enabled
                 mask_loss = None
+                normal_loss = None
                 if predict_mask:
                     mask_output = model_output.sample[:, 1:2, ...]  # (N*Tp, 1, H, W)
                     if use_flow_matching:
@@ -418,16 +417,89 @@ def main(cfg : DictConfig) -> None:
                             mask_output, mask_target.float(), reduction="mean"
                         )
                 
+                # Normal loss (modular): L1 on normals, valid pixels only; only when t < 0.9
+                if use_normal_loss and x_t_image is not None and (timesteps < 0.9).any():
+                    from losses import (
+                        compute_normal_loss,
+                        get_normal_projection_layer,
+                        get_projection_config,
+                        range_to_normals,
+                    )
+
+                    x0_pred = recover_x0_from_velocity(
+                        x_t_image, timesteps, image_output_for_loss,
+                        path_type=flow_path_type,
+                    )
+                    # Convert [-1, 1] to [0, 1] for normal computation (divide first, then clamp)
+                    pred_range_01 = ((x0_pred + 1.0) / 2.0).clamp(0, 1)
+                    gt_range_01 = ((clean_images[:, 0:1] + 1.0) / 2.0).clamp(0, 1)
+
+                    # Log range image stats: first batch after resume, or every 500 global steps
+                    _log_normal_ranges = (
+                        global_step == 0
+                        or (global_step > 0 and global_step % 500 == 0)
+                        or (cfg.Env.resume_ckpt and epoch == first_epoch and step == resume_step)
+                    )
+                    if _log_normal_ranges and accelerator.is_main_process:
+                        _p, _g = x0_pred.detach(), clean_images[:, 0:1].detach()
+                        _p01, _g01 = pred_range_01.detach(), gt_range_01.detach()
+                        _gs = global_step  # snapshot before potential change
+                        msg = (
+                            f"[normal_loss] step={_gs} ranges: "
+                            f"x0_pred [{_p.min().item():.4f}, {_p.max().item():.4f}] | "
+                            f"gt [-1,1] [{_g.min().item():.4f}, {_g.max().item():.4f}] | "
+                            f"pred_01 [{_p01.min().item():.4f}, {_p01.max().item():.4f}] | "
+                            f"gt_01 [{_g01.min().item():.4f}, {_g01.max().item():.4f}]"
+                        )
+                        print(msg, flush=True)
+                        gmin = getattr(pl_datamodule, 'range_image_global_min', None)
+                        gmax = getattr(pl_datamodule, 'range_image_global_max', None)
+                        if gmin is not None and gmax is not None:
+                            pred_m = _p01 * (gmax - gmin) + gmin
+                            gt_m = _g01 * (gmax - gmin) + gmin
+                            msg2 = (
+                                f"[normal_loss] step={_gs} meters (gmin={gmin:.4f}, gmax={gmax:.4f}): "
+                                f"pred [{pred_m.min().item():.4f}, {pred_m.max().item():.4f}] | "
+                                f"gt [{gt_m.min().item():.4f}, {gt_m.max().item():.4f}]"
+                            )
+                            print(msg2, flush=True)
+
+                    H, W = Vp.shape[3], Vp.shape[4]
+                    proj_cfg = get_projection_config(height=H, width=W)
+                    proj_layer = get_normal_projection_layer(proj_cfg)
+
+                    # Denormalize range [0, 1] -> meters for correct 3D geometry (KITTI_RANGE)
+                    global_min = getattr(pl_datamodule, 'range_image_global_min', None)
+                    global_max = getattr(pl_datamodule, 'range_image_global_max', None)
+                    pred_normals = range_to_normals(proj_layer, pred_range_01, height=H, width=W,
+                                                    global_min=global_min, global_max=global_max)
+                    gt_normals = range_to_normals(proj_layer, gt_range_01, height=H, width=W,
+                                                  global_min=global_min, global_max=global_max)
+
+                    # Only samples with t < 0.9 contribute to normal loss
+                    t_mask = (timesteps < 0.9).float().view(-1, 1, 1)  # (B, 1, 1)
+                    valid_mask_t = valid_mask * t_mask
+
+                    normal_loss = compute_normal_loss(
+                        pred_normals, gt_normals, valid_mask_t,
+                        loss_type=cfg.Training.get('normal_loss_type', 'l1'),
+                    )
+
                 # Combine losses
                 mask_weight = cfg.Training.get('mask_loss_weight', 1.0)
                 if mask_loss is not None:
                     loss = image_loss + mask_weight * mask_loss
-                
+                else:
+                    loss = image_loss
+
+                if normal_loss is not None:
+                    normal_weight = cfg.Training.get('normal_loss_weight', 0.1)
+                    loss = loss + normal_weight * normal_loss
 
                 # Projection loss (modular REPA)
                 proj_loss = None
                 if use_projection_loss and hasattr(model_output, 'projection_output') and model_output.projection_output is not None:
-                    from stdiff.losses import compute_projection_loss
+                    from losses import compute_projection_loss
                     # scalr_features: (N, Tp, N_grid, C), flatten to (N*Tp, N_grid, C)
                     zs = [scalr_features.flatten(0, 1).to(clean_images.device)]  # (N*Tp, N_grid, C)
                     zs_tilde = model_output.projection_output  # List of (N*Tp, N_grid, z_dim)
@@ -509,6 +581,8 @@ def main(cfg : DictConfig) -> None:
                     logs["image_loss"] = round(image_loss.detach().item(), 4)
                 else:
                     logs["mask_loss"] = 0.0
+            if normal_loss is not None:
+                logs["normal_loss"] = round(normal_loss.detach().item(), 4)
             if cfg.Training.use_ema:
                 logs["ema_decay"] = ema_model.cur_decay_value
             progress_bar.set_postfix(**logs)

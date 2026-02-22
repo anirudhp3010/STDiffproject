@@ -1,9 +1,9 @@
 Env:
     # KITTI Range training WITH MASK prediction (predict_mask=True)
     # Use kitti_range_test_config_wmask.yaml for inference
-    output_dir: '/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask_flow_matching'
+    output_dir: '/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask'
     logger: 'tensorboard'
-    resume_ckpt: "checkpoint-20550" # Set to checkpoint path if resuming
+    resume_ckpt: "checkpoint-27300" # Set to checkpoint path if resuming
     stdiff_init_ckpt: null
     
 
@@ -30,7 +30,7 @@ Dataset:
 
 STDiff:
     Diffusion:
-        prediction_type: 'v' # 'epsilon', 'sample', or 'v' (flow-matching)
+        prediction_type: 'epsilon' # 'epsilon', 'sample', or 'v' (flow-matching)
         flow_path_type: 'cosine'   # 'linear' or 'cosine' (only used when prediction_type='v')
         ddpm_num_steps: 1000
         ddpm_num_inference_steps: 50
@@ -104,5 +104,10 @@ Training:
     
     # Mask prediction settings
     predict_mask: True   # Enable mask prediction (requires masks in dataset)
-    mask_loss_weight: 0.2  # Weight for mask loss relative to image loss
+    mask_loss_weight: 0.1  # Weight for mask loss relative to image loss
+
+    # Normal map loss (modular): L1 on surface normals from single-step x0 recovery, valid pixels only
+    use_normal_loss: False   # Set True to enable; requires flow matching + masks
+    normal_loss_weight: 0.05  # Weight for normal loss relative to image loss
+    normal_loss_type: 'l1'  # 'l1' or 'cosine' (1 - cos_sim)
 
