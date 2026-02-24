@@ -67,7 +67,7 @@ class ScaLRFeatureLoader(BaseFeatureLoader):
         Returns:
             (N, C) tensor, N = H*W, or None if file not found
         """
-        path = self._resolve_path(sequence, frame)
+        path = self._resolve_path(sequence, frame).resolve()
         if not path.exists():
             return None
         data = np.load(path)
@@ -105,8 +105,11 @@ def load_scalr_features_for_clip(
     Returns:
         (T, N, C) tensor for T frames, or None if any frame missing
     """
+    import logging
     feats_list = []
     for npy_path in clip_files:
+        # Use absolute path so workers (different cwd) resolve correctly
+        npy_path = Path(npy_path).resolve()
         # Path: {root}/{seq}/processed/range/{frame}.npy
         parts = npy_path.as_posix().replace("\\", "/").split("/")
         if "processed" in parts:
@@ -120,6 +123,16 @@ def load_scalr_features_for_clip(
 
         f = loader.load(seq, frame)
         if f is None:
+            # One-time debug: log first failure so user can see resolved path
+            try:
+                load_scalr_features_for_clip._log_fail_once
+            except AttributeError:
+                load_scalr_features_for_clip._log_fail_once = True
+                feat_path = loader._resolve_path(seq, frame)
+                logging.getLogger(__name__).warning(
+                    "ScaLR load failed once. npy_path=%s seq=%s frame=%s -> feat_path=%s exists=%s",
+                    str(npy_path), seq, frame, str(feat_path), feat_path.exists(),
+                )
             return None
         feats_list.append(f)
 

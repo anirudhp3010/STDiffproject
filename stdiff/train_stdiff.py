@@ -138,6 +138,8 @@ def main(cfg : DictConfig) -> None:
     # Initialize the model (with optional REPA config)
     repa_config = cfg.STDiff.get("repa_config")
     model = STDiffDiffusers(cfg.STDiff.Diffusion.unet_config, cfg.STDiff.DiffNet, repa_config=repa_config)
+    if cfg.Training.get("use_projection_loss", False) and accelerator.is_main_process:
+        logger.info("REPA: repa_projector present=%s", model.repa_projector is not None)
     num_p_model = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f'num params of stdiff: {num_p_model/1e6} M')
 
@@ -266,6 +268,8 @@ def main(cfg : DictConfig) -> None:
         resume_step = resume_global_step % (num_update_steps_per_epoch * cfg.Training.gradient_accumulation_steps)
 
     # Train!
+    _warned_no_scalr = False  # one-time warning when REPA is on but ScaLR features never in batch
+    _logged_batch_len = False  # one-time debug: log batch format and projection path
     for epoch in range(first_epoch, cfg.Training.epochs):
         model.train()
         # Configure tqdm for immediate output flushing
@@ -274,16 +278,22 @@ def main(cfg : DictConfig) -> None:
         progress_bar.set_description(f"Epoch {epoch}")
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
-                # Handle batch format: 5 (no masks), 8 (with masks), 9 (with masks + features)
-                if len(batch) == 9:
+                # Handle batch format: 5 (no masks), 8 (with masks), 9 (with masks + features), 10 (+ scalr valid mask)
+                if len(batch) == 10:
+                    Vo, Vp, Vo_last_frame, idx_o, idx_p, Vo_mask, Vp_mask, Vo_last_mask, scalr_features, scalr_valid_mask = batch
+                    has_masks = True
+                    has_features = True
+                elif len(batch) == 9:
                     Vo, Vp, Vo_last_frame, idx_o, idx_p, Vo_mask, Vp_mask, Vo_last_mask, scalr_features = batch
                     has_masks = True
                     has_features = True
+                    scalr_valid_mask = None
                 elif len(batch) == 8:
                     Vo, Vp, Vo_last_frame, idx_o, idx_p, Vo_mask, Vp_mask, Vo_last_mask = batch
                     has_masks = True
                     has_features = False
                     scalr_features = None
+                    scalr_valid_mask = None
                 else:
                     Vo, Vp, Vo_last_frame, idx_o, idx_p = batch
                     has_masks = False
@@ -291,6 +301,18 @@ def main(cfg : DictConfig) -> None:
                     Vo_mask = None
                     Vp_mask = None
                     scalr_features = None
+                    scalr_valid_mask = None
+
+                if cfg.Training.get("use_projection_loss", False) and not has_features and not _warned_no_scalr and accelerator.is_main_process:
+                    _warned_no_scalr = True
+                    scalr_dir = cfg.Dataset.get("scalr_features_dir", "")
+                    scalr_root = scalr_dir if Path(scalr_dir).is_absolute() else Path(cfg.Dataset.dir) / scalr_dir
+                    logger.warning(
+                        "REPA projection loss is enabled but batches have no ScaLR features (proj=0). "
+                        "Ensure ScaLR features exist at <root>/<seq:02d>/<frame:06d>/feature_grid_8x64.npz "
+                        "(e.g. use R3DPA preprocess_scalr_features_semantickitti.py). Current root: %s",
+                        str(scalr_root),
+                    )
             
                 clean_images = Vp.flatten(0, 1)
                 # Flatten masks if they exist
@@ -317,7 +339,9 @@ def main(cfg : DictConfig) -> None:
                     N, Tp, C, H, W = Vp.shape
                     noise = (
                         torch.randn(N, C, H, W).unsqueeze(1).repeat(1, Tp, 1, 1, 1).flatten(0, 1).to(clean_images.device)
-                        + 0.15 * torch.randn(N * Tp, C, 1, 1, device=clean_images.device)
+                        + 0.01 * torch.randn(N * Tp, C, 1, 1, device=clean_images.device)  
+                        + 0.1 * torch.randn(N * Tp, C, 1, 1, device=clean_images.device)
+                        + 0.001 * torch.randn(N * Tp, C, 1, 1, device=clean_images.device)
                     )
                     Vo_last_frame = None
 
@@ -325,7 +349,9 @@ def main(cfg : DictConfig) -> None:
                     bsz, C, H, W = clean_images.shape
                     noise = (
                         torch.randn(clean_images.shape).to(clean_images.device)
-                        + 0.15 * torch.randn(bsz, C, 1, 1, device=clean_images.device)
+                        + 0.01 * torch.randn(bsz, C, 1, 1, device=clean_images.device) 
+                        + 0.1 * torch.randn(bsz, C, 1, 1, device=clean_images.device)
+                        + 0.001 * torch.randn(bsz, C, 1, 1, device=clean_images.device)
                     )
                 bsz = clean_images.shape[0]
                 # Sample timestep(s): discrete for DDPM, continuous for flow matching
@@ -496,16 +522,34 @@ def main(cfg : DictConfig) -> None:
                     normal_weight = cfg.Training.get('normal_loss_weight', 0.1)
                     loss = loss + normal_weight * normal_loss
 
+                # One-time debug: why proj might be 0
+                if cfg.Training.get("use_projection_loss", False) and not _logged_batch_len and accelerator.is_main_process:
+                    _logged_batch_len = True
+                    has_proj_out = hasattr(model_output, "projection_output") and model_output.projection_output is not None
+                    logger.info(
+                        "REPA debug: len(batch)=%s has_features=%s use_projection_loss=%s model has projection_output=%s",
+                        len(batch), has_features, use_projection_loss, has_proj_out,
+                    )
+
                 # Projection loss (modular REPA)
                 proj_loss = None
-                if use_projection_loss and hasattr(model_output, 'projection_output') and model_output.projection_output is not None:
+                if use_projection_loss and has_features and hasattr(model_output, 'projection_output') and model_output.projection_output is not None:
                     from losses import compute_projection_loss
                     # scalr_features: (N, Tp, N_grid, C), flatten to (N*Tp, N_grid, C)
                     zs = [scalr_features.flatten(0, 1).to(clean_images.device)]  # (N*Tp, N_grid, C)
                     zs_tilde = model_output.projection_output  # List of (N*Tp, N_grid, z_dim)
-                    proj_loss = compute_projection_loss(zs, zs_tilde)
-                    proj_coeff = cfg.Training.get('proj_coeff', 0.1)
-                    loss = loss + proj_coeff * proj_loss
+                    N, Tp = scalr_features.shape[0], scalr_features.shape[1]
+                    valid_mask = None
+                    if scalr_valid_mask is not None:
+                        valid_mask = scalr_valid_mask.unsqueeze(1).expand(-1, Tp).reshape(-1).to(clean_images.device)
+                        if valid_mask.any():
+                            proj_loss = compute_projection_loss(zs, zs_tilde, valid_mask=valid_mask)
+                        # else all invalid, skip proj_loss
+                    if proj_loss is None and (scalr_valid_mask is None or scalr_valid_mask.all()):
+                        proj_loss = compute_projection_loss(zs, zs_tilde)
+                    if proj_loss is not None:
+                        proj_coeff = cfg.Training.get('proj_coeff', 0.1)
+                        loss = loss + proj_coeff * proj_loss
                 
                 # Check for NaN or Inf loss
                 if torch.isnan(loss) or torch.isinf(loss):
@@ -573,6 +617,8 @@ def main(cfg : DictConfig) -> None:
                                         logger.warning(f"Failed to delete checkpoint {old_checkpoint}: {e}")
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
+            if cfg.Training.get("use_projection_loss", False):
+                logs["proj"] = round(proj_loss.detach().item(), 4) if proj_loss is not None else 0.0
             if proj_loss is not None:
                 logs["proj_loss"] = round(proj_loss.detach().item(), 4)
             if cfg.Training.get('predict_mask', False):
@@ -608,8 +654,14 @@ def main(cfg : DictConfig) -> None:
                 generator = torch.Generator(device=pipeline.device).manual_seed(0)
                 # run pipeline in inference (sample random noise and denoise)
                 batch = next(iter(train_dataloader))
-                # Handle both regular datasets (5 values) and range images with masks (8 values)
-                if len(batch) == 8:
+                # Handle batch format: 5 (no masks), 8 (with masks), 9 (+ scalr), 10 (+ scalr valid mask)
+                if len(batch) == 10:
+                    Vo, _, Vo_last_frame, idx_o, idx_p, _, Vp_mask, _, _, _ = batch
+                    has_masks = True
+                elif len(batch) == 9:
+                    Vo, _, Vo_last_frame, idx_o, idx_p, _, Vp_mask, _, _ = batch
+                    has_masks = True
+                elif len(batch) == 8:
                     Vo, _, Vo_last_frame, idx_o, idx_p, _, Vp_mask, _ = batch
                     has_masks = True
                 else:

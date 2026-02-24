@@ -16,7 +16,7 @@ Dataset:
     half_fps: False
     train_folder_ids: [0, 1, 2, 3, 4, 5, 6, 7]
     val_folder_ids: [8]
-    test_folder_ids: [9]  # Folder indices for testing
+    test_folder_ids: [0,8]  # Folder indices for testing
 
 STDiff:
     Diffusion:
@@ -66,8 +66,8 @@ STDiff:
 
 TestCfg:
     # Point to mask checkpoint (trained with kitti_range_train_config_wmask.yaml)
-    ckpt_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask/checkpoint-27000"
-    test_results_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask/test_results_wmask_27000_DDPM_50steps"
+    ckpt_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask/checkpoint-36150"
+    test_results_path: "/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask/test_results_wmask_36150_DDPM_50steps_tds_all"
     gradient_checkpointing: False
     use_xformers: False
     scheduler:

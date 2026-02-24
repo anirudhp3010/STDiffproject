@@ -1,9 +1,9 @@
 Env:
     # KITTI Range training WITH MASK prediction (predict_mask=True)
     # Use kitti_range_test_config_wmask.yaml for inference
-    output_dir: '/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask'
+    output_dir: '/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask_repa'
     logger: 'tensorboard'
-    resume_ckpt: "checkpoint-27300" # Set to checkpoint path if resuming
+    resume_ckpt: null # Set to checkpoint path if resuming
     stdiff_init_ckpt: null
     
 

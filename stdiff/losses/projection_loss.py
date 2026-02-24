@@ -44,6 +44,7 @@ def compute_projection_loss(
     zs: list,
     zs_tilde: list,
     reduce: str = "mean",
+    valid_mask: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     Compute projection loss over multiple encoder/encoder_types (e.g. multi-scale).
@@ -53,6 +54,7 @@ def compute_projection_loss(
         zs: List of encoder features, each (B, N, C)
         zs_tilde: List of projected model features, each (B, N, C)
         reduce: 'mean' or 'sum'
+        valid_mask: Optional (B,) or (B*T,) bool; if set, only average over True positions
 
     Returns:
         Scalar loss
@@ -60,15 +62,19 @@ def compute_projection_loss(
     total = 0.0
     count = 0
     for z, z_tilde in zip(zs, zs_tilde):
-        # Handle spatial alignment: if z is (B, N1, C) and z_tilde is (B, N2, C), interpolate
-        if z.shape[1] != z_tilde.shape[1]:
-            # Reshape z to (B, C, H, W) for interpolation
-            # Assume N = H*W; we need consistent grid
-            # Simple fallback: global average pool both and compare (B, C)
-            z_pool = z.mean(dim=1)
-            z_tilde_pool = z_tilde.mean(dim=1)
-            total += projection_loss(z_pool, z_tilde_pool, reduce="mean")
+        z_tilde_n = F.normalize(z_tilde, dim=-1)
+        z_n = F.normalize(z, dim=-1)
+        if z_n.dim() == 3:
+            cos_sim = (z_n * z_tilde_n).sum(dim=-1)
         else:
-            total += projection_loss(z, z_tilde, reduce="mean")
+            cos_sim = (z_n * z_tilde_n).sum(dim=-1)
+        loss_per_pos = -cos_sim  # (B, N) or (B,)
+        if valid_mask is not None:
+            m = valid_mask.to(loss_per_pos.device).reshape(-1)
+            if loss_per_pos.dim() == 2 and m.numel() == loss_per_pos.shape[0]:
+                m = m.unsqueeze(1).expand_as(loss_per_pos)
+            total += (loss_per_pos * m).sum() / m.sum().clamp(min=1)
+        else:
+            total += loss_per_pos.mean()
         count += 1
     return total / max(count, 1)

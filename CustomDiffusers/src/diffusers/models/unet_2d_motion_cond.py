@@ -236,6 +236,7 @@ class UNet2DMotionCond(ModelMixin, ConfigMixin):
         m_feat = None,
         class_labels: Optional[torch.Tensor] = None,
         return_dict: bool = True,
+        return_bottleneck: bool = False,
     ) -> Union[UNet2DOutput, Tuple]:
         r"""
         Args:
@@ -245,10 +246,13 @@ class UNet2DMotionCond(ModelMixin, ConfigMixin):
                 Optional class labels for conditioning. Their embeddings will be summed with the timestep embeddings.
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`~models.unet_2d.UNet2DOutput`] instead of a plain tuple.
+            return_bottleneck (`bool`, *optional*, defaults to `False`):
+                If True, return (output, bottleneck_tensor) where bottleneck is the mid_block output (for REPA projection).
 
         Returns:
             [`~models.unet_2d.UNet2DOutput`] or `tuple`: [`~models.unet_2d.UNet2DOutput`] if `return_dict` is True,
             otherwise a `tuple`. When returning a tuple, the first element is the sample tensor.
+            If return_bottleneck is True, returns (output, bottleneck) where output is as above.
         """
         # 0. center input if necessary
         if self.config.center_input_sample:
@@ -299,6 +303,7 @@ class UNet2DMotionCond(ModelMixin, ConfigMixin):
 
         # 4. mid
         sample = self.mid_block(sample, emb, m_feat=m_feat)
+        bottleneck = sample if return_bottleneck else None
 
         # 5. up
         skip_sample = None
@@ -322,6 +327,10 @@ class UNet2DMotionCond(ModelMixin, ConfigMixin):
         if self.config.time_embedding_type == "fourier":
             timesteps = timesteps.reshape((sample.shape[0], *([1] * len(sample.shape[1:]))))
             sample = sample / timesteps
+
+        if return_bottleneck and bottleneck is not None:
+            out = UNet2DOutput(sample=sample) if return_dict else (sample,)
+            return (out, bottleneck)
 
         if not return_dict:
             return (sample,)

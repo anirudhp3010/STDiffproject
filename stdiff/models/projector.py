@@ -70,12 +70,14 @@ class REPAProjector(nn.Module):
             H_t, W_t = self.target_grid
             # Reshape to (B, z_dim, H, W) for interpolation
             z_spatial = z.permute(0, 2, 1).reshape(B, self.z_dim, H, W)
+            # BFloat16 not supported by bicubic/bilinear on some backends; use float32 for interpolate
+            dtype_in = z_spatial.dtype
             z_spatial = torch.nn.functional.interpolate(
-                z_spatial,
+                z_spatial.float(),
                 size=self.target_grid,
                 mode=self.scale_mode,
                 align_corners=False,
-            )
+            ).to(dtype_in)
             z = z_spatial.permute(0, 2, 3, 1).reshape(B, H_t * W_t, self.z_dim)
 
         return z

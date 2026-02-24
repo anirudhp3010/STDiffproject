@@ -358,7 +358,7 @@ def main():
     parser.add_argument(
         "folder",
         type=str,
-        default= "./STDiff_ckpts/kitti_range_64x512_mask/test_results_wmask_27000_DDPM_50steps",#"test_results_nomask_checkpoint-332000_DDPM_50steps",#"test_results_nomask_checkpoint-319200_DDPM_50steps",'test_results_checkpoint-70400_50steps'
+        default= "./STDiff_ckpts/kitti_range_64x512_mask/test_results_wmask_36150_DDPM_50steps_tds_all",#"test_results_nomask_checkpoint-332000_DDPM_50steps",#"test_results_nomask_checkpoint-319200_DDPM_50steps",'test_results_checkpoint-70400_50steps'
         nargs="?",
         help="Folder containing Preds_*.pt files",
     )

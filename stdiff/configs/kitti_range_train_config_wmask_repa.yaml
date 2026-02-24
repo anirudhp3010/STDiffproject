@@ -4,9 +4,9 @@
 # Use R3DPA's preprocess_scalr_features_semantickitti.py to extract features
 
 Env:
-    output_dir: '/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask_flow_matching_repa'
+    output_dir: '/home/anirudh/STDiffProject/STDiff_ckpts/kitti_range_64x512_mask_flow_repa'
     logger: 'tensorboard'
-    resume_ckpt: null
+    resume_ckpt: "checkpoint-4350"
     stdiff_init_ckpt: null
 
 Dataset:
@@ -15,7 +15,7 @@ Dataset:
     phase: 'deploy'
     dev_set_size: null
     batch_size: 6
-    num_workers: 12
+    num_workers: 8  # 0 required for REPA: ScaLR feature loading works in main process; workers can fail on path/NFS
     num_channels: 1
     image_size: [64, 512]
     num_observed_frames: 3
@@ -29,12 +29,12 @@ Dataset:
     val_folder_ids: []
     test_folder_ids: [9]
     # ScaLR features (modular): path relative to Dataset.dir or absolute
-    scalr_features_dir: 'scalr_features'
+    scalr_features_dir: '/DATA2/common/kitti/scalr_features'
     scalr_grid_size: [8, 64]
 
 STDiff:
     Diffusion:
-        prediction_type: 'v'
+        prediction_type: 'epsilon'
         flow_path_type: 'cosine'
         ddpm_num_steps: 1000
         ddpm_num_inference_steps: 50
@@ -45,7 +45,7 @@ STDiff:
             out_channels: 2
             m_channels: 256
             layers_per_block: 2
-            block_out_channels: [128, 256, 256, 512, 512]
+            block_out_channels: [128, 256, 256, 512, 768]
             down_block_types: ["DownBlock2D","AttnDownBlock2D","AttnDownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D"]
             up_block_types: ["AttnUpBlock2D", "AttnUpBlock2D","AttnUpBlock2D", "AttnUpBlock2D", "UpBlock2D"]
             attention_head_dim: [null, 128, 128, 128, 128]
@@ -107,7 +107,7 @@ Training:
     gradient_checkpointing: True
     use_xformers: True
     predict_mask: True
-    mask_loss_weight: 0.2
+    mask_loss_weight: 0.1
     # REPA projection loss (modular)
     use_projection_loss: True
     proj_coeff: 0.1

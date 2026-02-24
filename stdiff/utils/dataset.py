@@ -218,7 +218,7 @@ class LitDataModule(pl.LightningDataModule):
                 scalr_loader = None
                 scalr_dir = self.cfg.Dataset.get("scalr_features_dir")
                 if scalr_dir:
-                    from stdiff.utils.scalr_features import ScaLRFeatureLoader
+                    from .scalr_features import ScaLRFeatureLoader
                     grid_size = tuple(self.cfg.Dataset.get("scalr_grid_size", [8, 64]))
                     scalr_root = scalr_dir if Path(scalr_dir).is_absolute() else Path(self.cfg.Dataset.dir) / scalr_dir
                     scalr_loader = ScaLRFeatureLoader(str(scalr_root), grid_size=grid_size, subdir="")
@@ -273,12 +273,26 @@ class LitDataModule(pl.LightningDataModule):
                         global_min=self.range_image_global_min, global_max=self.range_image_global_max,
                         train_folder_ids=train_folder_ids if use_explicit else None,
                         val_folder_ids=val_folder_ids if use_explicit else None,
-                        test_folder_ids=test_folder_ids)
+                        test_folder_ids=test_folder_ids, scalr_loader=scalr_loader)
                     if use_val:
                         self.train_set, self.val_set = KITTIRangeTrainData()
                     else:
                         self.train_set = KITTIRangeTrainData()
                         self.val_set = None
+                    # Main-process diagnostic when using cache (same as cache-miss path)
+                    import logging
+                    _log = logging.getLogger(__name__)
+                    if scalr_loader is not None and len(self.train_set.clips) > 0:
+                        from .scalr_features import load_scalr_features_for_clip
+                        num_predict = self.cfg.Dataset.num_predict_frames
+                        first_clip = self.train_set.clips[0]
+                        future_paths = list(first_clip[-num_predict:])
+                        feats = load_scalr_features_for_clip(scalr_loader, future_paths)
+                        if feats is not None:
+                            _log.info("ScaLR diagnostic (main process): loaded features shape %s for first clip.", feats.shape)
+                        else:
+                            p0 = Path(future_paths[0]).resolve() if future_paths else None
+                            _log.warning("ScaLR diagnostic (main process): FAILED to load for first clip. Example path: %s", p0)
                 else:
                     # Cache miss - compute global min/max from training set
                     # First, create dataset without transform to compute global min/max
@@ -360,6 +374,24 @@ class LitDataModule(pl.LightningDataModule):
                         self.train_set = KITTIRangeTrainData()
                         self.val_set = None
 
+                    # Main-process diagnostic: try loading ScaLR for first clip (so log appears in nohup)
+                    import logging
+                    _log = logging.getLogger(__name__)
+                    if scalr_loader is not None:
+                        if len(self.train_set.clips) > 0:
+                            from .scalr_features import load_scalr_features_for_clip
+                            num_predict = self.cfg.Dataset.num_predict_frames
+                            first_clip = self.train_set.clips[0]
+                            future_paths = list(first_clip[-num_predict:])
+                            feats = load_scalr_features_for_clip(scalr_loader, future_paths)
+                            if feats is not None:
+                                _log.info("ScaLR diagnostic (main process): loaded features shape %s for first clip.", feats.shape)
+                            else:
+                                p0 = Path(future_paths[0]).resolve() if future_paths else None
+                                _log.warning("ScaLR diagnostic (main process): FAILED to load for first clip. Example path: %s", p0)
+                        else:
+                            _log.warning("ScaLR diagnostic: scalr_loader set but train_set has 0 clips.")
+
             if self.cfg.Dataset.name == 'BAIR':
                 BAIR_train_whole_set = BAIRDataset(Path(self.cfg.Dataset.dir).joinpath('train'), self.train_transform, color_mode = 'RGB', 
                                                    num_observed_frames = self.cfg.Dataset.num_observed_frames, num_predict_frames = self.cfg.Dataset.num_predict_frames,
@@ -434,7 +466,7 @@ class LitDataModule(pl.LightningDataModule):
                 # ScaLR loader for test (also used when stage=test only)
                 scalr_loader_test = None
                 if self.cfg.Dataset.get("scalr_features_dir"):
-                    from stdiff.utils.scalr_features import ScaLRFeatureLoader
+                    from .scalr_features import ScaLRFeatureLoader
                     grid_size = tuple(self.cfg.Dataset.get("scalr_grid_size", [8, 64]))
                     scalr_dir = self.cfg.Dataset.get("scalr_features_dir")
                     scalr_root = scalr_dir if Path(scalr_dir).is_absolute() else Path(self.cfg.Dataset.dir) / scalr_dir
@@ -1033,10 +1065,24 @@ def svrfcn(batch_data, rand_Tp = 3, rand_predict = True, o_resize = None, p_resi
 
     if has_features:
         observe_clips, predict_clips, observe_masks, predict_masks, features_list = zip(*batch_data)
-        if all(f is not None for f in features_list):
+        valid_features_list = [f is not None for f in features_list]
+        if all(valid_features_list):
             features_batch = torch.stack(features_list, dim=0)
+            scalr_valid_mask = torch.ones(len(features_list), dtype=torch.bool)
+        elif any(valid_features_list):
+            # Partial features: fill missing with zeros so we always get 9/10 elements and can compute proj loss for valid samples
+            first_valid = next(f for f in features_list if f is not None)
+            device = first_valid.device
+            dtype = first_valid.dtype
+            shape = first_valid.shape
+            features_batch = torch.stack(
+                [f if f is not None else torch.zeros(shape, dtype=dtype, device=device) for f in features_list],
+                dim=0,
+            )
+            scalr_valid_mask = torch.tensor(valid_features_list, dtype=torch.bool)
         else:
             features_batch = None
+            scalr_valid_mask = None
     elif has_masks:
         observe_clips, predict_clips, observe_masks, predict_masks = zip(*batch_data)
         features_batch = None
@@ -1149,7 +1195,7 @@ def svrfcn(batch_data, rand_Tp = 3, rand_predict = True, o_resize = None, p_resi
         out = (observe_batch, rand_predict_batch, observe_last_batch, idx_o.to(torch.float), rand_idx.to(torch.float) + To, 
                observe_mask_batch, rand_predict_mask_batch, observe_last_mask_batch)
         if features_batch is not None:
-            out = out + (features_batch,)
+            out = out + (features_batch, scalr_valid_mask)
         return out
     else:
         return (observe_batch, rand_predict_batch, observe_last_batch, idx_o.to(torch.float), rand_idx.to(torch.float) + To)
@@ -1512,7 +1558,7 @@ class RangeImageClipDataset(Dataset):
         future_valid_mask = valid_masks_tensor[-self.num_predict_frames:, ...]  # (Tp, H, W)
 
         if self.scalr_loader is not None:
-            from stdiff.utils.scalr_features import load_scalr_features_for_clip
+            from .scalr_features import load_scalr_features_for_clip
             future_clip_files = clip_files[-self.num_predict_frames:]
             features = load_scalr_features_for_clip(self.scalr_loader, future_clip_files)
             # Always return 5 elements when scalr_loader set (features may be None if load failed)
